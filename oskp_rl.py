@@ -264,7 +264,7 @@ class BoxPilingEnv:
 
 
 # ---------------------
-# DQN Agent
+# Modified DQN Agent with Dueling Network, RMSprop, and LR Decay
 # ---------------------
 class DQNAgent:
     def __init__(self, state_dims, action_size=4):
@@ -272,7 +272,12 @@ class DQNAgent:
         self.action_size = action_size  # Four heuristics
         self.model = self._build_model()
         self.target_model = self._build_model()
-        self.optimizer = optim.Adam(self.model.parameters())
+        
+        # Use RMSprop with a new learning rate
+        self.optimizer = optim.RMSprop(self.model.parameters(), lr=0.001)
+        # Learning rate scheduler for exponential decay (decay 1% per episode)
+        self.scheduler = torch.optim.lr_scheduler.ExponentialLR(self.optimizer, gamma=0.99)
+        
         self.memory = []
         self.batch_size = 32
         self.gamma = 0.95
@@ -280,34 +285,55 @@ class DQNAgent:
         self.epsilon_min = 0.01
         self.epsilon_decay = 0.995
 
+        # Track optimizer steps per episode to ensure proper scheduler updates.
+        self.optimizer_step_count = 0
+
     def _build_model(self):
         class CustomNetwork(nn.Module):
             def __init__(self, pallet_size, action_size):
                 super().__init__()
+                # A deeper CNN with three convolutional layers
                 self.conv = nn.Sequential(
-                    nn.Conv2d(1, 16, kernel_size=3, padding=1),
+                    nn.Conv2d(1, 16, kernel_size=3, stride=1, padding=1),
+                    nn.ReLU(),
+                    nn.Conv2d(16, 32, kernel_size=3, stride=2, padding=1),
+                    nn.ReLU(),
+                    nn.Conv2d(32, 64, kernel_size=3, stride=2, padding=1),
                     nn.ReLU(),
                     nn.Flatten()
                 )
+                # Determine output dimension from conv layers
                 with torch.no_grad():
                     dummy_input = torch.zeros(1, 1, *pallet_size)
                     conv_out = self.conv(dummy_input).shape[1]
-                self.fc = nn.Sequential(
+                
+                # Dueling architecture: separate streams for value and advantage
+                self.fc_value = nn.Sequential(
+                    nn.Linear(conv_out + 3, 128),
+                    nn.ReLU(),
+                    nn.Linear(128, 1)
+                )
+                self.fc_advantage = nn.Sequential(
                     nn.Linear(conv_out + 3, 128),
                     nn.ReLU(),
                     nn.Linear(128, action_size)
                 )
+            
             def forward(self, height_map, box_dims):
                 conv_features = self.conv(height_map)
                 combined = torch.cat([conv_features, box_dims], dim=1)
-                return self.fc(combined)
+                value = self.fc_value(combined)
+                advantage = self.fc_advantage(combined)
+                q_values = value + (advantage - advantage.mean(dim=1, keepdim=True))
+                return q_values
+        
         return CustomNetwork(self.state_dims['height_map'], self.action_size)
-
+    
     def remember(self, state, action, reward, next_state, done):
         self.memory.append((state, action, reward, next_state, done))
         if len(self.memory) > 10000:
             self.memory.pop(0)
-
+    
     def act(self, state):
         if np.random.rand() <= self.epsilon:
             return random.choice(range(self.action_size))
@@ -316,36 +342,38 @@ class DQNAgent:
         with torch.no_grad():
             q_values = self.model(height_map, box_dims)
         return torch.argmax(q_values, dim=1).item()
-
+    
     def replay(self):
         if len(self.memory) < self.batch_size:
             return
         batch = random.sample(self.memory, self.batch_size)
         states, actions, rewards, next_states, dones = zip(*batch)
-
+    
         states_height_maps = np.array([s['height_map'] for s in states], dtype=np.float32)
         states_box_dims = np.array([s['box_dims'] for s in states], dtype=np.float32)
         next_states_height_maps = np.array([s['height_map'] for s in next_states], dtype=np.float32)
         next_states_box_dims = np.array([s['box_dims'] for s in next_states], dtype=np.float32)
-
+    
         height_maps = torch.FloatTensor(states_height_maps).unsqueeze(1)
         box_dims = torch.FloatTensor(states_box_dims)
         next_height_maps = torch.FloatTensor(next_states_height_maps).unsqueeze(1)
         next_box_dims = torch.FloatTensor(next_states_box_dims)
-
+    
         current_q = self.model(height_maps, box_dims).gather(1, torch.LongTensor(actions).unsqueeze(1))
         with torch.no_grad():
             next_q = self.target_model(next_height_maps, next_box_dims).max(1)[0]
         dones = torch.FloatTensor([1 if d else 0 for d in dones])
         target_q = torch.FloatTensor(rewards) + self.gamma * next_q * (1 - dones)
-
+    
         loss = nn.MSELoss()(current_q.squeeze(), target_q)
         self.optimizer.zero_grad()
         loss.backward()
         self.optimizer.step()
-
+        self.optimizer_step_count += 1  # Increment after each optimizer step
+    
     def update_target_model(self):
         self.target_model.load_state_dict(self.model.state_dict())
+
 
 # ---------------------
 # Training Loop
@@ -354,7 +382,10 @@ def train(episodes_boxes, output_dir):
     """
     Train the RL agent using the provided episodes_boxes.
     Saves all visualization images (pallet plots and trend graph) in output_dir.
-    Returns a pandas DataFrame with final metrics.
+    Returns a pandas DataFrame with final metrics including:
+      - Episode utilization
+      - Heuristic selection percentages per episode
+      - A summary row with global averages
     """
     env = BoxPilingEnv()
     agent = DQNAgent(
@@ -373,34 +404,56 @@ def train(episodes_boxes, output_dir):
         done = False
         boxes = episodes_boxes[episode]
         box_idx = 0
+
+        # Initialize per-episode heuristic counts.
+        episode_heuristic_counts = {
+            'stacking': 0,
+            'best_fit': 0,
+            'semi_perfect_fit': 0,
+            'random_fit': 0
+        }
+        total_decisions = 0
         
         while not done and box_idx < len(boxes):
             box_dims = boxes[box_idx]
             box_idx += 1
             state = env.new_box_arrival(box_dims)
             
+            # Select heuristic
             heuristic_index = agent.act(state)
             heuristic = heuristic_map[heuristic_index]
+            episode_heuristic_counts[heuristic] += 1
+            total_decisions += 1
+
             action = env.choose_action_by_heuristic(heuristic)
             
             if action is None:
                 # Penalize and keep same box if no valid action is available.
                 reward = -2000
                 continue
-
+    
             next_state, reward, done, info = env.step(action)
             agent.remember(state, heuristic_index, reward, next_state, done)
             agent.replay()
             agent.update_target_model()
             state = next_state
             episode_reward += reward
-
+    
         # Compute container utilization
         pallet_volume = env.pallet_size[0] * env.pallet_size[1] * env.max_height
         placed_volume = sum(b[2] * b[3] * b[4] for b in env.placed_boxes)
         utilization = placed_volume / pallet_volume if pallet_volume > 0 else 0
         total_utilization += utilization
         
+        # Compute heuristic percentages for the episode
+        if total_decisions > 0:
+            perc_stacking = episode_heuristic_counts['stacking'] / total_decisions * 100
+            perc_best_fit = episode_heuristic_counts['best_fit'] / total_decisions * 100
+            perc_semi_perfect_fit = episode_heuristic_counts['semi_perfect_fit'] / total_decisions * 100
+            perc_random_fit = episode_heuristic_counts['random_fit'] / total_decisions * 100
+        else:
+            perc_stacking = perc_best_fit = perc_semi_perfect_fit = perc_random_fit = 0
+
         episode_metrics = {
             'episode': episode + 1,
             'utilization': utilization,
@@ -409,7 +462,11 @@ def train(episodes_boxes, output_dir):
             'boxes_attempted': box_idx,
             'placed_boxes': len(env.placed_boxes),
             'max_height': np.max(env.current_height_map),
-            'avg_height': np.mean(env.current_height_map)
+            'avg_height': np.mean(env.current_height_map),
+            'perc_stacking': perc_stacking,
+            'perc_best_fit': perc_best_fit,
+            'perc_semi_perfect_fit': perc_semi_perfect_fit,
+            'perc_random_fit': perc_random_fit
         }
         all_metrics.append(episode_metrics)
         
@@ -425,12 +482,17 @@ def train(episodes_boxes, output_dir):
             )
         
         agent.epsilon = max(agent.epsilon_min, agent.epsilon * agent.epsilon_decay)
+        # Only update the scheduler if at least one optimizer step was taken this episode
+        if agent.optimizer_step_count > 0:
+            agent.scheduler.step()
+            agent.optimizer_step_count = 0  # Reset the count after stepping the scheduler
         
         print(f"Episode: {episode+1:04d} | Util: {utilization:.1%} | "
               f"Invalid Learned: {env.invalid_actions_learned:02d} | "
               f"Invalid Attempted: {env.invalid_actions_attempted:02d} | "
-              f"Boxes: {len(env.placed_boxes):02d}/{box_idx:02d} | ε: {agent.epsilon:.3f}")
-
+              f"Boxes: {len(env.placed_boxes):02d}/{box_idx:02d} | "
+              f"ε: {agent.epsilon:.3f}")
+    
     avg_utilization = total_utilization / total_episodes
     total_invalid_learned = sum(m['invalid_learned'] for m in all_metrics)
     total_invalid_attempted = sum(m['invalid_attempted'] for m in all_metrics)
@@ -438,10 +500,36 @@ def train(episodes_boxes, output_dir):
     print(f"Average Utilization: {avg_utilization:.2%}")
     print(f"Total Invalid Learned: {total_invalid_learned}")
     print(f"Total Invalid Attempted: {total_invalid_attempted}")
-
+    
+    # Compute global average heuristic percentages
+    avg_perc_stacking = np.mean([m['perc_stacking'] for m in all_metrics])
+    avg_perc_best_fit = np.mean([m['perc_best_fit'] for m in all_metrics])
+    avg_perc_semi_perfect_fit = np.mean([m['perc_semi_perfect_fit'] for m in all_metrics])
+    avg_perc_random_fit = np.mean([m['perc_random_fit'] for m in all_metrics])
+    
+    # Create a summary row and append it to the final metrics DataFrame
+    summary_metrics = {
+        'episode': 'SUMMARY',
+        'utilization': avg_utilization,
+        'invalid_learned': total_invalid_learned,
+        'invalid_attempted': total_invalid_attempted,
+        'boxes_attempted': '',
+        'placed_boxes': '',
+        'max_height': '',
+        'avg_height': '',
+        'perc_stacking': avg_perc_stacking,
+        'perc_best_fit': avg_perc_best_fit,
+        'perc_semi_perfect_fit': avg_perc_semi_perfect_fit,
+        'perc_random_fit': avg_perc_random_fit
+    }
+    
+    final_metrics_df = pd.DataFrame(all_metrics)
+    summary_df = pd.DataFrame([summary_metrics])
+    final_metrics_df = pd.concat([final_metrics_df, summary_df], ignore_index=True)
+    
     # Plot utilization trend and save it in the output_dir
     plt.figure(figsize=(12, 6))
-    episodes = [m['episode'] for m in all_metrics]
+    episodes = [m['episode'] if isinstance(m['episode'], int) else total_episodes for m in all_metrics]
     utilizations = [m['utilization'] for m in all_metrics]
     window_size = 100
     moving_avg = np.convolve(utilizations, np.ones(window_size)/window_size, mode='valid')
@@ -454,9 +542,7 @@ def train(episodes_boxes, output_dir):
     trend_file = os.path.join(output_dir, 'utilization_trend.png')
     plt.savefig(trend_file)
     plt.close()
-
-    # Convert final metrics to a pandas DataFrame and return it.
-    final_metrics_df = pd.DataFrame(all_metrics)
+    
     return final_metrics_df
 
 # -------------
@@ -472,5 +558,5 @@ def train(episodes_boxes, output_dir):
 #     output_directory = os.path.join(os.getcwd(), "training_output")
 #     os.makedirs(output_directory, exist_ok=True)
 #     final_metrics = train(episodes_boxes, output_dir=output_directory)
-#     # Optionally, you can also save the final metrics to CSV here.
+#     # Save the final metrics (including heuristic percentages and summary) to CSV.
 #     final_metrics.to_csv(os.path.join(output_directory, "final_metrics.csv"), index=False)
