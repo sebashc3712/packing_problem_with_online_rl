@@ -1,3 +1,4 @@
+import os
 import numpy as np
 import torch
 import torch.nn as nn
@@ -5,6 +6,7 @@ import torch.optim as optim
 import random
 import matplotlib.pyplot as plt
 from mpl_toolkits.mplot3d import Axes3D
+import pandas as pd  # For exporting metrics to CSV/DataFrame
 
 # ---------------------
 # Environment Class
@@ -18,8 +20,8 @@ class BoxPilingEnv:
         self.placed_boxes = []
 
         # Track invalid actions:
-        self.invalid_actions_learned = 0      # No valid actions in choose_action
-        self.invalid_actions_attempted = 0    # Attempted an invalid step
+        self.invalid_actions_learned = 0      # When no valid action exists in choose_action
+        self.invalid_actions_attempted = 0    # When an attempted action fails in step
 
     def reset(self):
         self.current_height_map = np.zeros(self.pallet_size)
@@ -30,20 +32,14 @@ class BoxPilingEnv:
         return self._get_state()
 
     def _get_state(self):
-        """Return the current observation (height map + current box dims)."""
         box_dims = self.current_box if self.current_box is not None else np.zeros(3)
-        return {
-            'height_map': self.current_height_map.copy(),
-            'box_dims': box_dims
-        }
+        return {'height_map': self.current_height_map.copy(), 'box_dims': box_dims}
 
     def new_box_arrival(self, box_dims):
-        """Receive a new box from the conveyor."""
         self.current_box = box_dims
         return self._get_state()
 
     def get_rotated_box_dims(self, box, rotation):
-        """Return the width, depth, height of the box for a given rotation index."""
         valid_rotations = [
             (0, 1, 2),  # Original (L, W, H)
             (1, 0, 2),  # Swap width & depth
@@ -55,38 +51,34 @@ class BoxPilingEnv:
         return tuple(box[i] for i in valid_rotations[rotation])
 
     def _is_valid_placement(self, x, y, w, d, h):
-        """Check boundaries, height limit, and require full support with no bridging."""
         # 1) Boundary check
         if (x + w > self.pallet_size[0]) or (y + d > self.pallet_size[1]):
             return False
 
-        # 2) Check if placing this box would exceed max height
+        # 2) Height limit: placing box must not exceed max height
         placement_area = self.current_height_map[x:x+w, y:y+d]
         base_height = np.max(placement_area)
         if base_height + h > self.max_height:
             return False
 
-        # 3) Require that the entire region is exactly at base_height
-        #    (no bridging on partial columns, no partial region at 0).
+        # 3) Require that the entire region is exactly at base_height (no partial bridging)
         if not np.all(placement_area == base_height):
             return False
 
-        # 4) Require full support coverage (no partial bridging):
+        # 4) Full support: the entire area must be supported
         support_count = np.sum(placement_area == base_height)
-        if support_count < (w * d):  # must be fully supported
+        if support_count < (w * d):
             return False
 
         return True
 
     def _update_height_map(self, x, y, w, d, h):
-        """Update the height map and return the base_z offset of this box."""
         placement_area = self.current_height_map[x:x+w, y:y+d]
-        base_z = np.max(placement_area)  # the height at which the box's base sits
+        base_z = np.max(placement_area)  # base height where the box sits
         self.current_height_map[x:x+w, y:y+d] = base_z + h
         return base_z
 
     def _calculate_maximal_flat_area(self, height_map):
-        """Compute the largest rectangular area in the height map that has uniform height."""
         max_area = 0
         unique_heights = np.unique(height_map)
         for level in unique_heights:
@@ -96,7 +88,6 @@ class BoxPilingEnv:
         return max_area
 
     def _maximal_rectangle(self, matrix):
-        """Largest rectangle in a binary matrix (standard histogram approach)."""
         if matrix.size == 0:
             return 0
         rows, cols = matrix.shape
@@ -114,11 +105,9 @@ class BoxPilingEnv:
         return max_area
 
     def _is_terminal(self):
-        """End condition: entire pallet is at or above max height."""
         return np.all(self.current_height_map >= self.max_height)
 
     def get_valid_actions(self, box_dims):
-        """Return all valid actions (x, y, rotation) for the current box."""
         valid_actions = []
         for rotation in range(6):
             w, d, h = self.get_rotated_box_dims(box_dims, rotation)
@@ -197,7 +186,6 @@ class BoxPilingEnv:
             return self.heuristic_semi_perfect_fit(valid_actions)
 
     def choose_action_by_heuristic(self, heuristic_name):
-        """Return a chosen action or None if no valid actions exist."""
         valid_actions = self.get_valid_actions(self.current_box)
         if not valid_actions:
             self.invalid_actions_learned += 1
@@ -219,7 +207,6 @@ class BoxPilingEnv:
         return action
 
     def step(self, action):
-        """Apply the chosen action in the environment."""
         rotation = action % 6
         remaining = action // 6
         yy = remaining % self.pallet_size[1]
@@ -229,14 +216,11 @@ class BoxPilingEnv:
         if not self._is_valid_placement(xx, yy, w, d, h):
             self.invalid_actions_attempted += 1
             reward = -2000
-            # Return the same state so the agent can try again
             return self._get_state(), reward, False, {"invalid": True}
 
         base_z = self._update_height_map(xx, yy, w, d, h)
-        # Store (x, y, w, d, h, base_z) so we can visualize from the correct z-offset
         self.placed_boxes.append((xx, yy, w, d, h, base_z))
 
-        # Reward: improvement in maximal flat area
         original_max_space = self._calculate_maximal_flat_area(self.current_height_map)
         temp_height_map = self.current_height_map.copy()
         temp_height_map[xx:xx+w, yy:yy+d] += h
@@ -248,21 +232,14 @@ class BoxPilingEnv:
         return self._get_state(), reward, done, {}
 
     def visualize_pallet(self, episode_num, boxes_attempted, utilization,
-                         invalid_learned, invalid_attempted):
-        """Plot the 3D pallet with boxes drawn at the correct z-offset."""
+                         invalid_learned, invalid_attempted, output_dir=""):
         fig = plt.figure(figsize=(15, 8))
         ax = fig.add_subplot(111, projection='3d')
         
         for i, (xx, yy, w, d, h, base_z) in enumerate(self.placed_boxes):
             color = plt.cm.tab20(i % 20)
-            ax.bar3d(
-                xx, yy, base_z,  # base position
-                w, d, h,         # size in each dimension
-                shade=True,
-                color=color,
-                edgecolor='black',
-                linewidth=0.5
-            )
+            ax.bar3d(xx, yy, base_z, w, d, h, shade=True,
+                     color=color, edgecolor='black', linewidth=0.5)
         
         ax.set_title(
             f"Episode {episode_num} - 3D Box Visualization\n"
@@ -276,12 +253,15 @@ class BoxPilingEnv:
         ax.set_ylabel('Y Position')
         ax.set_zlabel('Height')
 
-        # Optionally mark empty spots:
         invalid_mask = self.current_height_map == 0
         ax.scatter(*np.where(invalid_mask), color='red', s=10, label='Unusable Space')
         plt.legend()
-        plt.savefig(f'episode_{episode_num}_results.png', dpi=150, bbox_inches='tight')
+        
+        # Save in the provided output directory.
+        filename = os.path.join(output_dir, f'episode_{episode_num}_results.png')
+        plt.savefig(filename, dpi=150, bbox_inches='tight')
         plt.close()
+
 
 # ---------------------
 # DQN Agent
@@ -343,7 +323,6 @@ class DQNAgent:
         batch = random.sample(self.memory, self.batch_size)
         states, actions, rewards, next_states, dones = zip(*batch)
 
-        # Convert states
         states_height_maps = np.array([s['height_map'] for s in states], dtype=np.float32)
         states_box_dims = np.array([s['box_dims'] for s in states], dtype=np.float32)
         next_states_height_maps = np.array([s['height_map'] for s in next_states], dtype=np.float32)
@@ -371,7 +350,12 @@ class DQNAgent:
 # ---------------------
 # Training Loop
 # ---------------------
-def train(episodes_boxes):
+def train(episodes_boxes, output_dir):
+    """
+    Train the RL agent using the provided episodes_boxes.
+    Saves all visualization images (pallet plots and trend graph) in output_dir.
+    Returns a pandas DataFrame with final metrics.
+    """
     env = BoxPilingEnv()
     agent = DQNAgent(
         state_dims={'height_map': env.pallet_size, 'box_dims': 3},
@@ -400,7 +384,7 @@ def train(episodes_boxes):
             action = env.choose_action_by_heuristic(heuristic)
             
             if action is None:
-                # If no valid action is available, penalize and keep same box
+                # Penalize and keep same box if no valid action is available.
                 reward = -2000
                 continue
 
@@ -417,7 +401,6 @@ def train(episodes_boxes):
         utilization = placed_volume / pallet_volume if pallet_volume > 0 else 0
         total_utilization += utilization
         
-        # Log metrics
         episode_metrics = {
             'episode': episode + 1,
             'utilization': utilization,
@@ -437,10 +420,10 @@ def train(episodes_boxes):
                 boxes_attempted=box_idx,
                 utilization=utilization,
                 invalid_learned=env.invalid_actions_learned,
-                invalid_attempted=env.invalid_actions_attempted
+                invalid_attempted=env.invalid_actions_attempted,
+                output_dir=output_dir
             )
         
-        # Epsilon decay
         agent.epsilon = max(agent.epsilon_min, agent.epsilon * agent.epsilon_decay)
         
         print(f"Episode: {episode+1:04d} | Util: {utilization:.1%} | "
@@ -456,7 +439,7 @@ def train(episodes_boxes):
     print(f"Total Invalid Learned: {total_invalid_learned}")
     print(f"Total Invalid Attempted: {total_invalid_attempted}")
 
-    # Plot utilization trend
+    # Plot utilization trend and save it in the output_dir
     plt.figure(figsize=(12, 6))
     episodes = [m['episode'] for m in all_metrics]
     utilizations = [m['utilization'] for m in all_metrics]
@@ -468,8 +451,13 @@ def train(episodes_boxes):
     plt.ylabel('Utilization')
     plt.title('Learning Progress')
     plt.legend()
-    plt.savefig('utilization_trend.png')
+    trend_file = os.path.join(output_dir, 'utilization_trend.png')
+    plt.savefig(trend_file)
     plt.close()
+
+    # Convert final metrics to a pandas DataFrame and return it.
+    final_metrics_df = pd.DataFrame(all_metrics)
+    return final_metrics_df
 
 # -------------
 # Usage Example
@@ -480,4 +468,9 @@ def train(episodes_boxes):
 #         [np.random.randint(1, 5, size=3).tolist() for _ in range(random.randint(5, 15))]
 #         for _ in range(2100)
 #     ]
-#     train(episodes_boxes)
+#     # Provide an output directory where all visualization files and CSV will be saved.
+#     output_directory = os.path.join(os.getcwd(), "training_output")
+#     os.makedirs(output_directory, exist_ok=True)
+#     final_metrics = train(episodes_boxes, output_dir=output_directory)
+#     # Optionally, you can also save the final metrics to CSV here.
+#     final_metrics.to_csv(os.path.join(output_directory, "final_metrics.csv"), index=False)
