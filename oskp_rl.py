@@ -109,6 +109,7 @@ class BoxPilingEnv:
 
     def get_valid_actions(self, box_dims):
         valid_actions = []
+        mapping = {}
         for rotation in range(6):
             w, d, h = self.get_rotated_box_dims(box_dims, rotation)
             for xx in range(self.pallet_size[0] - w + 1):
@@ -116,7 +117,8 @@ class BoxPilingEnv:
                     if self._is_valid_placement(xx, yy, w, d, h):
                         action = xx * self.pallet_size[1] * 6 + yy * 6 + rotation
                         valid_actions.append(action)
-        return valid_actions
+                        mapping[str(action)] = str((xx, yy, w, d, h))
+        return valid_actions, mapping
 
     # ---------------------
     # Heuristics
@@ -186,10 +188,10 @@ class BoxPilingEnv:
             return self.heuristic_semi_perfect_fit(valid_actions)
 
     def choose_action_by_heuristic(self, heuristic_name):
-        valid_actions = self.get_valid_actions(self.current_box)
+        valid_actions, mapping = self.get_valid_actions(self.current_box)
         if not valid_actions:
             self.invalid_actions_learned += 1
-            return None
+            return None, None
 
         if heuristic_name == 'stacking':
             action = self.heuristic_stacking(valid_actions)
@@ -204,7 +206,7 @@ class BoxPilingEnv:
 
         if action not in valid_actions:
             action = random.choice(valid_actions)
-        return action
+        return action, mapping[str(action)]
 
     def step(self, action):
         rotation = action % 6
@@ -378,7 +380,7 @@ class DQNAgent:
 # ---------------------
 # Training Loop
 # ---------------------
-def train(episodes_boxes, output_dir):
+def train(episodes_boxes, output_dir, verbose=False, episode_to_show=100):
     """
     Train the RL agent using the provided episodes_boxes.
     Saves all visualization images (pallet plots and trend graph) in output_dir.
@@ -425,20 +427,29 @@ def train(episodes_boxes, output_dir):
             episode_heuristic_counts[heuristic] += 1
             total_decisions += 1
 
-            action = env.choose_action_by_heuristic(heuristic)
+            action, mapping = env.choose_action_by_heuristic(heuristic)
             
+            if verbose and episode == episode_to_show:
+                print(env.current_height_map)
+                print(f"Box: {box_idx:02d} | Heuristic: {heuristic} | Action: {mapping}")
+            
+            # Modification: End the episode if no valid action is available.
             if action is None:
-                # Penalize and keep same box if no valid action is available.
+                # No valid action exists for the current box.
+                # Penalize and "close" the pallet by ending the episode.
                 reward = -2000
-                continue
-    
+                agent.remember(state, heuristic_index, reward, state, True)
+                episode_reward += reward
+                done = True  # End the episode immediately
+                break
+
             next_state, reward, done, info = env.step(action)
             agent.remember(state, heuristic_index, reward, next_state, done)
             agent.replay()
             agent.update_target_model()
             state = next_state
             episode_reward += reward
-    
+        
         # Compute container utilization
         pallet_volume = env.pallet_size[0] * env.pallet_size[1] * env.max_height
         placed_volume = sum(b[2] * b[3] * b[4] for b in env.placed_boxes)
@@ -548,15 +559,16 @@ def train(episodes_boxes, output_dir):
 # -------------
 # Usage Example
 # -------------
-# if __name__ == "__main__":
-#     # Example: generate random episodes of boxes
-#     episodes_boxes = [
-#         [np.random.randint(1, 5, size=3).tolist() for _ in range(random.randint(5, 15))]
-#         for _ in range(2100)
-#     ]
-#     # Provide an output directory where all visualization files and CSV will be saved.
-#     output_directory = os.path.join(os.getcwd(), "training_output")
-#     os.makedirs(output_directory, exist_ok=True)
-#     final_metrics = train(episodes_boxes, output_dir=output_directory)
-#     # Save the final metrics (including heuristic percentages and summary) to CSV.
-#     final_metrics.to_csv(os.path.join(output_directory, "final_metrics.csv"), index=False)
+""" if __name__ == "__main__":
+    # Example: generate random episodes of boxes
+    episodes_boxes = [
+        [np.random.randint(1, 5, size=3).tolist() for _ in range(random.randint(5, 15))]
+        for _ in range(2100)
+    ]
+    # Provide an output directory where all visualization files and CSV will be saved.
+    output_directory = os.path.join(os.getcwd(), "training_output")
+    os.makedirs(output_directory, exist_ok=True)
+    final_metrics = train(episodes_boxes, output_dir=output_directory)
+    # Save the final metrics (including heuristic percentages and summary) to CSV.
+    final_metrics.to_csv(os.path.join(output_directory, "final_metrics.csv"), index=False)
+ """

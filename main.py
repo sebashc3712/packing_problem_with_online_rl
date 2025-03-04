@@ -24,7 +24,7 @@ for file in cut_files:
     # IMPORTANT: Modify your oskp_rl.train function so that it accepts an argument (e.g. output_dir)
     # and saves all visualization files (pallet images and trend graph) in that folder.
     # Also, have the training function return a pandas DataFrame with the final metrics.
-    final_metrics = oskp_rl.train(instance, output_dir=output_dir)
+    final_metrics = oskp_rl.train(instance, output_dir=output_dir, verbose=True, episode_to_show=100)
     
     # Save final metrics to CSV in the output folder.
     csv_path = os.path.join(output_dir, "final_metrics.csv")
