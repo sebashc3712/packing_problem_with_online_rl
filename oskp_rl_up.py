@@ -42,13 +42,13 @@ class BoxPilingEnv:
     def get_rotated_box_dims(self, box, rotation):
         valid_rotations = [
             (0, 1, 2),  # Original (L, W, H)
- """            (1, 0, 2),  # Swap width & depth
-            (0, 2, 1),  # Swap depth & height
+            #(1, 0, 2),  # Swap width & depth
+            #(0, 2, 1),  # Swap depth & height
             (2, 1, 0),  # Swap width & height
-            (1, 2, 0),  # Rotate all
-            (2, 0, 1)   # Rotate all """
+            #(1, 2, 0),  # Rotate all
+            #(2, 0, 1)   # Rotate all
         ]
-        return (box[0],box[1],box[2])
+        return tuple(box[i] for i in valid_rotations[rotation])
 
     def _is_valid_placement(self, x, y, w, d, h):
         # 1) Boundary check
@@ -110,12 +110,12 @@ class BoxPilingEnv:
     def get_valid_actions(self, box_dims):
         valid_actions = []
         mapping = {}
-        for rotation in range(1):
+        for rotation in range(2):
             w, d, h = self.get_rotated_box_dims(box_dims, rotation)
             for xx in range(self.pallet_size[0] - w + 1):
                 for yy in range(self.pallet_size[1] - d + 1):
                     if self._is_valid_placement(xx, yy, w, d, h):
-                        action = xx * self.pallet_size[1] * 1 + yy * 1 + rotation
+                        action = xx * self.pallet_size[1] * 2 + yy * 2 + rotation
                         valid_actions.append(action)
                         mapping[str(action)] = str((xx, yy, w, d, h))
         return valid_actions, mapping
@@ -127,8 +127,8 @@ class BoxPilingEnv:
         best_action = None
         best_support = -np.inf
         for action in valid_actions:
-            rotation = action % 1
-            remaining = action // 1
+            rotation = action % 2
+            remaining = action // 2
             yy = remaining % self.pallet_size[1]
             xx = remaining // self.pallet_size[1]
             w, d, h = self.get_rotated_box_dims(self.current_box, rotation)
@@ -143,8 +143,8 @@ class BoxPilingEnv:
         best_action = None
         best_gap = np.inf
         for action in valid_actions:
-            rotation = action % 1
-            remaining = action // 1
+            rotation = action % 2
+            remaining = action // 2
             yy = remaining % self.pallet_size[1]
             xx = remaining // self.pallet_size[1]
             w, d, h = self.get_rotated_box_dims(self.current_box, rotation)
@@ -160,8 +160,8 @@ class BoxPilingEnv:
         best_action = None
         best_score = np.inf
         for action in valid_actions:
-            rotation = action % 1
-            remaining = action // 1
+            rotation = action % 2
+            remaining = action // 2
             yy = remaining % self.pallet_size[1]
             xx = remaining // self.pallet_size[1]
             w, d, h = self.get_rotated_box_dims(self.current_box, rotation)
@@ -209,8 +209,8 @@ class BoxPilingEnv:
         return action, mapping[str(action)]
 
     def step(self, action):
-        rotation = action % 1
-        remaining = action // 1
+        rotation = action % 2
+        remaining = action // 2
         yy = remaining % self.pallet_size[1]
         xx = remaining // self.pallet_size[1]
 
