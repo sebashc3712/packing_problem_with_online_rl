@@ -588,24 +588,27 @@ def train(episodes_boxes, output_dir, verbose=False, episode_to_show=100, defer_
     summary_df = pd.DataFrame([summary_metrics])
     final_metrics_df = pd.concat([final_metrics_df, summary_df], ignore_index=True)
 
-    # Plot utilization trend and save it in the output_dir
+    # trend
     plt.figure(figsize=(12, 6))
-    episodes_axis = [m['episode'] if isinstance(m['episode'], int) else total_episodes for m in all_metrics]
-    utilizations = [m['utilization'] for m in all_metrics]
-    window_size = 100
-    if len(utilizations) >= window_size:
-        moving_avg = np.convolve(utilizations, np.ones(window_size)/window_size, mode='valid')
-        plt.plot(episodes_axis, utilizations, alpha=0.3, label='Episode Utilization')
-        plt.plot(episodes_axis[window_size-1:], moving_avg, label=f'{window_size}-Episode Moving Avg')
-    else:
-        plt.plot(episodes_axis, utilizations, label='Episode Utilization')
+
+    # Use only the per-episode rows (skip the SUMMARY row if present)
+    rows = [m for m in all_metrics if isinstance(m['episode'], int)]
+    ep_axis = [m['episode'] for m in rows]
+    util = np.array([m['utilization'] for m in rows], dtype=float)
+
+    # Cumulative average up to episode t
+    cum_avg = np.cumsum(util) / np.arange(1, util.size + 1)
+
+    plt.plot(ep_axis, util, alpha=0.3, label='Episode Utilization')
+    plt.plot(ep_axis, cum_avg, linewidth=2, label='Cumulative Avg (1..t)')
+
     plt.xlabel('Episode')
     plt.ylabel('Utilization')
     plt.title('Learning Progress')
     plt.legend()
+
     os.makedirs(output_dir, exist_ok=True)
-    trend_file = os.path.join(output_dir, 'utilization_trend.png')
-    plt.savefig(trend_file)
+    plt.savefig(os.path.join(output_dir, 'utilization_trend.png'))
     plt.close()
 
     return final_metrics_df

@@ -103,7 +103,4 @@ def summarize_variants(root_dir: str,
 
     return summary
 
-# --- Example usage ---
-root = "/Users/sebastian.herrera/packing_problem_with_online_rl/"   # the directory that contains cut_1, cut_1_fixed, rs, rs_up, etc.
-summary_df = summarize_variants(root, save_csv=os.path.join(root, "summary_variants.csv"))
-print(summary_df.to_string(index=False))
+
