@@ -25,6 +25,35 @@ def _max_zero_run(bool_1d):
     return max_run
 
 
+# ================================
+# Utility: Maximal Rectangle
+# ================================
+def _maximal_rectangle(matrix):
+    if matrix.size == 0:
+        return 0
+    _, cols = matrix.shape
+    max_area = 0
+    heights = np.zeros(cols, dtype=int)
+    for row in matrix:
+        heights = np.where(row == 1, heights + 1, 0)
+        stack = []
+        for i in range(cols + 1):
+            while stack and (i == cols or heights[i] < heights[stack[-1]]):
+                h = heights[stack.pop()]
+                w = i if not stack else i - stack[-1] - 1
+                max_area = max(max_area, h * w)
+            stack.append(i)
+    return max_area
+
+def calculate_average_flat_area(height_map):
+    areas = []
+    for level in np.unique(height_map):
+        binary_matrix = (height_map == level).astype(int)
+        current_max = _maximal_rectangle(binary_matrix)
+        areas.append(current_max)
+    return np.mean(areas) if areas else 0
+
+
 # =========================================================
 # Ground-truth feasibility mask with BRIDGING rule (GT)
 # =========================================================
@@ -108,7 +137,6 @@ def compute_gt_mask(
                     # COM must lie within the span of supports (basic stability)
                     continue
 
-                # Opposite-edge spanning condition (either X or Y)
                 if require_opposite_edge_support:
                     ok_x = axis_ok(support_mask, l, w, axis=0, max_gap_local=max_gap)
                     ok_y = axis_ok(support_mask, l, w, axis=1, max_gap_local=max_gap)
@@ -116,6 +144,43 @@ def compute_gt_mask(
                         continue
 
                 mask[r_idx, x, y] = True
+
+    # Filter mask by maximizing Average Maximal Space
+    # Identify all stable candidates
+    candidates = np.argwhere(mask) # (N, 3) -> (rot, x, y)
+    
+    if len(candidates) > 0:
+        scores = []
+        for rot, x, y in candidates:
+            l, w, h = (int(box_dims[rotations[rot][0]]), int(box_dims[rotations[rot][1]]), int(box_dims[rotations[rot][2]]))
+            
+            # Simulate placement
+            temp_hm = height_map.copy()
+            # Need to know placement base_z. 
+            # We must re-calculate base_z or trust it hasn't changed? 
+            # It's safer to re-calc quickly.
+            region = temp_hm[x:x+l, y:y+w]
+            base_z = np.max(region)
+            temp_hm[x:x+l, y:y+w] = base_z + h
+            
+            score = calculate_average_flat_area(temp_hm)
+            scores.append(score)
+            
+        scores = np.array(scores)
+        max_score = np.max(scores)
+        
+        # Keep only those within small tolerance (float issues) or exact? 
+        # Exact is fine for discrete areas, but mean might be float.
+        # Let's use small tolerance.
+        keep_indices = np.where(scores >= max_score - 1e-5)[0]
+        
+        # Reset mask and only set keep_indices
+        new_mask = np.zeros_like(mask)
+        for idx in keep_indices:
+            r, x, y = candidates[idx]
+            new_mask[r, x, y] = True
+        mask = new_mask
+
     return mask
 
 
@@ -134,7 +199,12 @@ class BoxPilingEnv:
     ):
         self.pallet_size = pallet_size
         self.max_height = max_height
+        # VOXEL GRID: 0=Empty, 1=Occupied
+        self.voxels = np.zeros((pallet_size[0], pallet_size[1], max_height), dtype=int)
+        
+        # Keep current_height_map for observation compatibility (Top-Down Projection)
         self.current_height_map = np.zeros(pallet_size)
+        
         self.current_box = None
         self.placed_boxes = []
 
@@ -148,6 +218,7 @@ class BoxPilingEnv:
         self.invalid_actions_attempted = 0
 
     def reset(self):
+        self.voxels = np.zeros((self.pallet_size[0], self.pallet_size[1], self.max_height), dtype=int)
         self.current_height_map = np.zeros(self.pallet_size)
         self.placed_boxes = []
         self.invalid_actions_learned = 0
@@ -168,58 +239,85 @@ class BoxPilingEnv:
         return tuple(int(box[i]) for i in valid_rotations[rotation])
 
     def _is_valid_placement(self, x, y, w, d, h):
+        L, W, H = self.pallet_size[0], self.pallet_size[1], self.max_height
+        
         # 1) Bounds
-        if (x + w > self.pallet_size[0]) or (y + d > self.pallet_size[1]):
-            return False
+        if (x + w > L) or (y + d > W):
+            return False, -1
 
-        region = self.current_height_map[x:x + w, y:y + d]
-        base_z = int(np.max(region))
+        # Search for lowest valid Z (Gravity)
+        # We start from z = 0 and go up.
+        # Box occupies [z, z+h]. Max valid z is H-h.
+        
+        best_z = -1
+        
+        # To optimize: find max height under the box footprint from 'current_height_map'?
+        # No, because now we can go UNDER boxes (overhangs).
+        # We must scan.
+        
+        for z in range(H - h + 1):
+            # Check Collision: Volume must be empty
+            # box volume: voxels[x:x+w, y:y+d, z:z+h]
+            if np.any(self.voxels[x:x+w, y:y+d, z:z+h]):
+                continue
+                
+            # Check REACHABILITY (Front-Loading from Y=0)
+            # Volume [x:x+w, 0:y, z:z+h] should be empty?
+            # Actually, standard pallet loading usually implies placing "behind" first?
+            # If Front is Y=0, we load from Y=0 towards Y=Max.
+            # So if we place at y=5, we need path from y=0..5 to be clear.
+            # Path Volume: [x:x+w, 0:y, z:z+h] must be empty.
+            if y > 0:
+                path_vol = self.voxels[x:x+w, 0:y, z:z+h]
+                if np.any(path_vol):
+                    continue
+            
+            # Check Support (Gravity / Physics)
+            # If z=0, supported by floor.
+            # If z>0, need support from z-1.
+            if z > 0:
+                support_layer = self.voxels[x:x+w, y:y+d, z-1]
+                support_count = np.sum(support_layer)
+                support_ratio = support_count / (w * d)
+                
+                if support_ratio < self.min_support_ratio:
+                    continue
+                    
+                # Support spanning logic (bridging) applies to the support_layer
+                # ... (Simplified for Voxel: Ratio check is usually enough, but we keep spanning if strict)
+                if self.require_opposite_edge_support:
+                    # Check X-spanning
+                    col_any = np.any(support_layer, axis=1) # Length w
+                    ok_x = (col_any[0] and col_any[-1] and _max_zero_run(col_any) <= self.max_gap)
+                    
+                    # Check Y-spanning
+                    row_any = np.any(support_layer, axis=0) # Length d
+                    ok_y = (row_any[0] and row_any[-1] and _max_zero_run(row_any) <= self.max_gap)
+                    
+                    if not (ok_x or ok_y):
+                        continue
+                        
+                # Centroid check? Skipped for voxel simplicity unless requested.
+            
+            # If all checks pass, this z is valid. 
+            # Since we want lowest z (gravity), we return it immediately.
+            return True, z
+            
+        return False, -1
 
-        # 2) Height limit
-        if base_z + h > self.max_height:
-            return False
-
-        # 3) BRIDGING support rule
-        support_mask = (region == base_z)
-        support_ratio = support_mask.sum() / (w * d)
-        if support_ratio < self.min_support_ratio:
-            return False
-
-        # basic COM-in-span stability
-        com_x = (w - 1) / 2.0
-        com_y = (d - 1) / 2.0
-        xs, ys = np.where(support_mask)
-        if xs.size == 0:
-            return False
-        if not (xs.min() <= com_x <= xs.max() and ys.min() <= com_y <= ys.max()):
-            return False
-
-        # opposite-edge spanning check
-        def axis_ok(mask, span_axis, max_gap_local):
-            if span_axis == 0:  # X axis spanning
-                col_any = mask.any(axis=1)  # length w
-                if not (col_any[0] and col_any[-1]):
-                    return False
-                return _max_zero_run(col_any) <= max_gap_local
-            else:               # Y axis spanning
-                row_any = mask.any(axis=0)  # length d
-                if not (row_any[0] and row_any[-1]):
-                    return False
-                return _max_zero_run(row_any) <= max_gap_local
-
-        if self.require_opposite_edge_support:
-            ok_x = axis_ok(support_mask, 0, self.max_gap)
-            ok_y = axis_ok(support_mask, 1, self.max_gap)
-            if not (ok_x or ok_y):
-                return False
-
-        return True
-
-    def _update_height_map(self, x, y, w, d, h):
-        region = self.current_height_map[x:x + w, y:y + d]
-        base_z = int(np.max(region))
-        self.current_height_map[x:x + w, y:y + d] = base_z + h
-        return base_z
+    def _update_height_map(self, x, y, w, d, h, z):
+        # Update Voxels
+        self.voxels[x:x+w, y:y+d, z:z+h] = 1
+        
+        # Update Height Map (Projection) - optional but good for observation
+        # Scan z from top
+        # Or just naive max:
+        # For region, set to max(old, z+h)? 
+        # No, because we might place *under*. Height map should represent *highest point*.
+        # So:
+        region = self.current_height_map[x:x+w, y:y+d]
+        self.current_height_map[x:x+w, y:y+d] = np.maximum(region, z+h)
+        return z
 
     # unchanged “maximal flat area”; reward still based on flatness.
     # You can redesign reward later to credit bridging more directly.
@@ -249,7 +347,11 @@ class BoxPilingEnv:
         return max_area
 
     def _is_terminal(self):
-        return np.all(self.current_height_map >= self.max_height)
+        # Terminal if full? Or just no space? RL usually runs until done or max steps.
+        # "Volume full" is a good check.
+        return np.all(self.voxels) # Highly unlikely to be 100% full.
+        # usually controlled by box stream end.
+        pass
 
     def get_valid_actions(self, box_dims, pred_mask=None):
         """Uses predicted mask to prune, but final validity uses BRIDGING rule."""
@@ -274,10 +376,11 @@ class BoxPilingEnv:
                 iter_points = [(xx, yy) for xx in xs for yy in ys]
 
             for (xx, yy) in iter_points:
-                if self._is_valid_placement(xx, yy, w, d, h):
+                valid, z = self._is_valid_placement(xx, yy, w, d, h)
+                if valid:
                     action = xx * W * 2 + yy * 2 + rotation
                     valid_actions.append(action)
-                    mapping[str(action)] = str((xx, yy, w, d, h))
+                    mapping[str(action)] = str((xx, yy, w, d, h, z))
         return valid_actions, mapping
 
     def can_place_box(self, box_dims):
@@ -293,10 +396,13 @@ class BoxPilingEnv:
             yy = remaining % self.pallet_size[1]
             xx = remaining // self.pallet_size[1]
             w, d, h = self.get_rotated_box_dims(self.current_box, rotation)
-            region = self.current_height_map[xx:xx + w, yy:yy + d]
-            support_level = np.max(region)
-            if support_level > best_support:
-                best_support, best_action = support_level, action
+            valid, z = self._is_valid_placement(xx, yy, w, d, h)
+            if valid:
+                support_level = z # minimize z? or maximize support? Stacking usually prioritizes Higher Z (densely).
+                # But here Stacking might mean "On top of others".
+                # Let's say Stacking = Max Z.
+                if support_level > best_support:
+                    best_support, best_action = support_level, action
         return best_action
 
     def heuristic_best_fit(self, valid_actions):
@@ -307,11 +413,11 @@ class BoxPilingEnv:
             yy = remaining % self.pallet_size[1]
             xx = remaining // self.pallet_size[1]
             w, d, h = self.get_rotated_box_dims(self.current_box, rotation)
-            region = self.current_height_map[xx:xx + w, yy:yy + d]
-            support_level = np.max(region)
-            gap = self.max_height - (support_level + h)
-            if gap < best_gap:
-                best_gap, best_action = gap, action
+            valid, z = self._is_valid_placement(xx, yy, w, d, h)
+            if valid:
+                gap = self.max_height - (z + h)
+                if gap < best_gap:
+                    best_gap, best_action = gap, action
         return best_action
 
     def heuristic_semi_perfect_fit(self, valid_actions):
@@ -322,14 +428,20 @@ class BoxPilingEnv:
             yy = remaining % self.pallet_size[1]
             xx = remaining // self.pallet_size[1]
             w, d, h = self.get_rotated_box_dims(self.current_box, rotation)
-            region = self.current_height_map[xx:xx + w, yy:yy + d]
-            support_level = np.max(region)
-            support_count = np.sum(region == support_level)
-            waste = (w * d - support_count)
-            gap = self.max_height - (support_level + h)
-            score = waste + gap
-            if score < best_score:
-                best_score, best_action = score, action
+            valid, z = self._is_valid_placement(xx, yy, w, d, h)
+            if valid:
+                # Calculate support in the layer below
+                # support_count = sum(voxels[... z-1])
+                if z == 0:
+                    support_count = w * d
+                else:
+                    support_count = np.sum(self.voxels[xx:xx+w, yy:yy+d, z-1])
+                
+                waste = (w * d - support_count)
+                gap = self.max_height - (z + h)
+                score = waste + gap
+                if score < best_score:
+                    best_score, best_action = score, action
         return best_action
 
     def heuristic_random_fit(self, valid_actions):
@@ -341,6 +453,52 @@ class BoxPilingEnv:
         return (self.heuristic_stacking(valid_actions)
                 if np.random.rand() < p_stack
                 else self.heuristic_semi_perfect_fit(valid_actions))
+
+    def heuristic_corner(self, valid_actions):
+        best_action, best_score = None, -np.inf
+        L, W = self.pallet_size
+        
+        for action in valid_actions:
+            rotation = action % 2
+            remaining = action // 2
+            yy = remaining % self.pallet_size[1]
+            xx = remaining // self.pallet_size[1]
+            w, d, h = self.get_rotated_box_dims(self.current_box, rotation)
+            valid, base_z = self._is_valid_placement(xx, yy, w, d, h)
+            
+            if not valid:
+                continue
+                
+            # Count touching sides (3D Voxel Neighbors?)
+            # Simplified: Use 2.5D logic on the placement layer?
+            # Or count voxel faces?
+            # Let's stick to "Walls/Boxes" at the placement level `base_z`.
+            
+            sides_touching = 0
+            # Scan perimeter at level base_z
+            # (Similar logic to before but checking voxels)
+            
+            # West
+            if xx == 0: sides_touching += 1
+            elif np.any(self.voxels[xx-1, yy:yy+d, base_z:base_z+h]): sides_touching += 1
+            
+            # East
+            if xx + w == L: sides_touching += 1
+            elif np.any(self.voxels[xx+w, yy:yy+d, base_z:base_z+h]): sides_touching += 1
+            
+            # North
+            if yy == 0: sides_touching += 1
+            elif np.any(self.voxels[xx:xx+w, yy-1, base_z:base_z+h]): sides_touching += 1
+            
+            # South
+            if yy + d == W: sides_touching += 1
+            elif np.any(self.voxels[xx:xx+w, yy+d, base_z:base_z+h]): sides_touching += 1
+            
+            score = sides_touching * 100 - base_z
+            if score > best_score:
+                best_score, best_action = score, action
+                
+        return best_action
 
     def choose_action_by_heuristic(self, heuristic_name, pred_mask=None):
         valid_actions, mapping = self.get_valid_actions(self.current_box, pred_mask=pred_mask)
@@ -356,6 +514,8 @@ class BoxPilingEnv:
             action = self.heuristic_semi_perfect_fit(valid_actions)
         elif heuristic_name == 'random_fit':
             action = self.heuristic_random_fit(valid_actions)
+        elif heuristic_name == 'corner':
+            action = self.heuristic_corner(valid_actions)
         else:
             raise ValueError("Unknown heuristic")
 
@@ -370,23 +530,24 @@ class BoxPilingEnv:
         xx = remaining // self.pallet_size[1]
 
         w, d, h = self.get_rotated_box_dims(self.current_box, rotation)
-        if not self._is_valid_placement(xx, yy, w, d, h):
+        
+        valid, base_z = self._is_valid_placement(xx, yy, w, d, h)
+        if not valid:
             self.invalid_actions_attempted += 1
             reward = -2000
             return self._get_state(), reward, False, {"invalid": True}
 
-        base_z = self._update_height_map(xx, yy, w, d, h)
+        self._update_height_map(xx, yy, w, d, h, base_z)
         self.placed_boxes.append((xx, yy, w, d, h, base_z))
 
-        # (reward unchanged; still encourages creating large flat areas)
-        original_max_space = self._calculate_maximal_flat_area(self.current_height_map)
-        temp_height_map = self.current_height_map.copy()
-        temp_height_map[xx:xx + w, yy:yy + d] += h
-        new_max_space = self._calculate_maximal_flat_area(temp_height_map)
-        reward = (new_max_space / original_max_space) * 100 if original_max_space > 0 else 0
-
+        # Reward: Volume Utilization
+        # (Box Volume / Pallet Volume) * Scale
+        pallet_vol = self.pallet_size[0] * self.pallet_size[1] * self.max_height
+        box_vol = w * d * h
+        reward = (box_vol / pallet_vol) * 1000 # Scaling factor
+        
         self.current_box = None
-        done = self._is_terminal()
+        done = False # controlled by stream
         return self._get_state(), reward, done, {}
 
     def visualize_pallet(self, episode_num, boxes_attempted, utilization,
@@ -394,13 +555,12 @@ class BoxPilingEnv:
         fig = plt.figure(figsize=(15, 8))
         ax = fig.add_subplot(111, projection='3d')
 
-        for i, (xx, yy, w, d, h, base_z) in enumerate(self.placed_boxes):
-            color = plt.cm.tab20(i % 20)
-            ax.bar3d(xx, yy, base_z, w, d, h, shade=True,
-                     color=color, edgecolor='black', linewidth=0.5)
+        # Voxel Visualization
+        # self.voxels is (L, W, H)
+        ax.voxels(self.voxels, edgecolor='k', alpha=0.7)
 
         ax.set_title(
-            f"Episode {episode_num} - 3D Box Visualization\n"
+            f"Episode {episode_num} - 3D Voxel Visualization\n"
             f"Utilization: {utilization:.1%} | "
             f"Invalid Learned: {invalid_learned} | Invalid Attempted: {invalid_attempted}"
         )
@@ -410,10 +570,6 @@ class BoxPilingEnv:
         ax.set_xlabel('X Position')
         ax.set_ylabel('Y Position')
         ax.set_zlabel('Height')
-
-        invalid_mask = self.current_height_map == 0
-        ax.scatter(*np.where(invalid_mask), color='red', s=10, label='Unusable Space')
-        plt.legend()
 
         filename = os.path.join(output_dir, f'episode_{episode_num}_results.png')
         plt.savefig(filename, dpi=150, bbox_inches='tight')
@@ -427,7 +583,7 @@ class DQNAgent:
     def __init__(
         self,
         state_dims,
-        action_size=4,
+        action_size=5,
         max_height=10,
         # same bridging params for GT mask
         min_support_ratio=0.50,
@@ -610,7 +766,7 @@ def train(
     )
     agent = DQNAgent(
         state_dims={'height_map': env.pallet_size, 'box_dims': 3},
-        action_size=4,
+        action_size=5,
         max_height=env.max_height,
         min_support_ratio=min_support_ratio,
         require_opposite_edge_support=require_opposite_edge_support,
@@ -621,13 +777,13 @@ def train(
     total_episodes = len(episodes_boxes)
     total_utilization = 0.0
     all_metrics = []
-    heuristic_map = {0: 'stacking', 1: 'best_fit', 2: 'semi_perfect_fit', 3: 'random_fit'}
+    heuristic_map = {0: 'stacking', 1: 'best_fit', 2: 'semi_perfect_fit', 3: 'random_fit', 4: 'corner'}
 
     def proxy_scores_for_heuristics(env_obj, pred_mask):
-        scores = {'stacking': -1e9, 'best_fit': -1e9, 'semi_perfect_fit': -1e9, 'random_fit': 0.0}
+        scores = {'stacking': -1e9, 'best_fit': -1e9, 'semi_perfect_fit': -1e9, 'random_fit': 0.0, 'corner': -1e9}
         box = env_obj.current_box
         if box is None:
-            return [0.0, 0.0, 0.0, 0.0]
+            return [0.0, 0.0, 0.0, 0.0, 0.0]
         Lp, Wp = env_obj.pallet_size
         for rot in [0, 1]:
             w, d, h = env_obj.get_rotated_box_dims(box, rot)
@@ -641,10 +797,31 @@ def train(
                 support_count = int(np.sum(region == support))
                 gap = float(env_obj.max_height - (support + h))
                 waste = int(w * d - support_count)
+                
+                # Corner score calc
+                base_z = support
+                sides = 0
+                # West
+                if xx == 0: sides += 1
+                elif np.any(env_obj.current_height_map[xx-1, yy:yy+d] >= base_z): sides += 1
+                # East
+                if xx+w == Lp: sides += 1
+                elif np.any(env_obj.current_height_map[xx+w, yy:yy+d] >= base_z): sides += 1
+                # North
+                if yy == 0: sides += 1
+                elif np.any(env_obj.current_height_map[xx:xx+w, yy-1] >= base_z): sides += 1
+                # South
+                if yy+d == Wp: sides += 1
+                elif np.any(env_obj.current_height_map[xx:xx+w, yy+d] >= base_z): sides += 1
+                
+                c_score = sides * 100 - base_z
+                
                 scores['stacking'] = max(scores['stacking'], support)
                 scores['best_fit'] = max(scores['best_fit'], -gap)
                 scores['semi_perfect_fit'] = max(scores['semi_perfect_fit'], -(waste + gap))
-        return [scores['stacking'], scores['best_fit'], scores['semi_perfect_fit'], scores['random_fit']]
+                scores['corner'] = max(scores['corner'], c_score)
+                
+        return [scores['stacking'], scores['best_fit'], scores['semi_perfect_fit'], scores['random_fit'], scores['corner']]
 
     for episode in range(total_episodes):
         state = env.reset()
@@ -749,6 +926,7 @@ def train(
             'perc_best_fit': perc['best_fit'],
             'perc_semi_perfect_fit': perc['semi_perfect_fit'],
             'perc_random_fit': perc['random_fit'],
+            'perc_corner': perc['corner'],
         })
 
         if (episode + 1) % 100 == 0:
@@ -783,6 +961,7 @@ def train(
     avg_perc_best_fit = np.mean([m['perc_best_fit'] for m in all_metrics])
     avg_perc_semi = np.mean([m['perc_semi_perfect_fit'] for m in all_metrics])
     avg_perc_rand = np.mean([m['perc_random_fit'] for m in all_metrics])
+    avg_perc_corner = np.mean([m['perc_corner'] for m in all_metrics])
 
     summary_metrics = {
         'episode': 'SUMMARY',
@@ -796,7 +975,8 @@ def train(
         'perc_stacking': avg_perc_stacking,
         'perc_best_fit': avg_perc_best_fit,
         'perc_semi_perfect_fit': avg_perc_semi,
-        'perc_random_fit': avg_perc_rand
+        'perc_random_fit': avg_perc_rand,
+        'perc_corner': avg_perc_corner
     }
 
     final_metrics_df = pd.DataFrame(all_metrics + [summary_metrics])

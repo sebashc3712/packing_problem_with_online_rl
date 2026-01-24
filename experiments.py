@@ -66,7 +66,7 @@ def evaluate(agent, episodes_boxes, env_params):
         # It's better if we can reuse the loop logic. 
         # Since I can't easily import the loop body, I'll rewrite a simplified inference loop.
         
-        heuristic_map = {0: 'stacking', 1: 'best_fit', 2: 'semi_perfect_fit', 3: 'random_fit'}
+        heuristic_map = {0: 'stacking', 1: 'best_fit', 2: 'semi_perfect_fit', 3: 'random_fit', 4: 'corner'}
         
         while not done and box_idx < len(boxes):
             box_dims = boxes[box_idx]
