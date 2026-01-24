@@ -433,10 +433,12 @@ class DQNAgent:
         min_support_ratio=0.50,
         require_opposite_edge_support=True,
         max_gap=2,
+        learning_rate=0.001,
     ):
         self.state_dims = state_dims
         self.action_size = action_size
         self.max_height = max_height
+        self.learning_rate = learning_rate
 
         # store GT policy for mask supervision
         self.min_support_ratio = float(min_support_ratio)
@@ -446,7 +448,7 @@ class DQNAgent:
         self.model = self._build_model()
         self.target_model = self._build_model()
 
-        self.optimizer = optim.RMSprop(self.model.parameters(), lr=0.001)
+        self.optimizer = optim.RMSprop(self.model.parameters(), lr=self.learning_rate)
         self.scheduler = torch.optim.lr_scheduler.ExponentialLR(self.optimizer, gamma=0.99)
 
         self.memory = []
@@ -597,6 +599,9 @@ def train(
     min_support_ratio=0.50,
     require_opposite_edge_support=True,
     max_gap=2,
+    learning_rate=0.001,
+    max_buffer_size=float('inf'),
+    return_agent=False,
 ):
     env = BoxPilingEnv(
         min_support_ratio=min_support_ratio,
@@ -610,9 +615,10 @@ def train(
         min_support_ratio=min_support_ratio,
         require_opposite_edge_support=require_opposite_edge_support,
         max_gap=max_gap,
+        learning_rate=learning_rate,
     )
 
-    total_episodes = 2100
+    total_episodes = len(episodes_boxes)
     total_utilization = 0.0
     all_metrics = []
     heuristic_map = {0: 'stacking', 1: 'best_fit', 2: 'semi_perfect_fit', 3: 'random_fit'}
@@ -693,7 +699,8 @@ def train(
             box_idx += 1
             placed, _ = try_place_one_box(box_dims)
             if not placed:
-                buffer.append(box_dims)
+                if len(buffer) < max_buffer_size:
+                    buffer.append(box_dims)
             if env._is_terminal():
                 done = True
                 break
@@ -709,7 +716,8 @@ def train(
                 if placed:
                     made_progress = True
                 else:
-                    new_buffer.append(box_dims)
+                    if len(new_buffer) < max_buffer_size:
+                        new_buffer.append(box_dims)
                 if env._is_terminal():
                     done = True; break
             buffer = new_buffer
@@ -798,27 +806,29 @@ def train(
 
     # Use only the per-episode rows (skip the SUMMARY row if present)
     rows = [m for m in all_metrics if isinstance(m['episode'], int)]
-    ep_axis = [m['episode'] for m in rows]
-    util = np.array([m['utilization'] for m in rows], dtype=float)
-
-    # Cumulative average up to episode t
-    cum_avg = np.cumsum(util) / np.arange(1, util.size + 1)
-
-    plt.plot(ep_axis, util, alpha=0.3, label='Episode Utilization')
-    plt.plot(ep_axis, cum_avg, linewidth=2, label='Cumulative Avg (1..t)')
-
+    episodes_x = [r['episode'] for r in rows]
+    utils_y = [r['utilization'] for r in rows]
+    
+    plt.plot(episodes_x, utils_y, label='Utilization', alpha=0.6)
+    
+    # moving average
+    w = 50
+    if len(utils_y) >= w:
+        ma = pd.Series(utils_y).rolling(window=w).mean()
+        plt.plot(episodes_x, ma, label=f'MA({w})', color='red', linewidth=2)
+        
     plt.xlabel('Episode')
     plt.ylabel('Utilization')
-    plt.title('Learning Progress')
+    plt.title('Training Utilization Trend')
     plt.legend()
-
-    os.makedirs(output_dir, exist_ok=True)
-    plt.savefig(os.path.join(output_dir, 'utilization_trend.png'))
+    plt.grid(True)
+    if output_dir:
+        plt.savefig(os.path.join(output_dir, 'utilization_trend.png'))
     plt.close()
-
-
+    
+    if return_agent:
+        return final_metrics_df, agent
     return final_metrics_df
-
 
 """ # -------------
 # Usage Example
