@@ -1,4 +1,0 @@
-1.⁠ ⁠Bin Packing (lleno el contenedor con las cajas que no caben) DONE
-2.⁠ ⁠maximal spaces sin espacio continuos (ejemplo del modelo con pesos) DONE
-3.⁠ ⁠revisar loss function de la red para ver si está aprendiendo lo suficiente
-4.⁠ ⁠Máscara de atención (investigar) DONE 

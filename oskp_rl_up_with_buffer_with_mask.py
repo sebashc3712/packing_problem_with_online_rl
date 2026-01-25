@@ -62,47 +62,20 @@ def compute_gt_mask(
     box_dims,
     pallet_size=(10, 10),
     max_height=10,
-    min_support_ratio=0.50,
-    require_opposite_edge_support=True,
-    max_gap=2,
 ):
     """
     Returns a boolean mask of shape (2, L, W), one channel per rotation:
-      rot 0: (L, W, H)
-      rot 1: (H, W, L)
-
-    BRIDGING rule (matches env._is_valid_placement):
+      rot 0: (l, w, h)
+      rot 1: (h, w, l)
+    
+    Standard Height Map Rule:
       - The box rests at base_z = max(placement_area).
-      - Support cells = {cells at base_z}.
-      - Must satisfy:
-          * support_ratio >= min_support_ratio
-          * (optional) along X OR along Y:
-              supports touch both opposite edges AND max gap of unsupported
-              consecutive columns/rows along that axis <= max_gap
-          * COM-in-span: the footprint center lies between the min/max supported
-              indices along both axes (basic stability check).
       - Height limit: base_z + h <= max_height
-      - Bounds satisfied
+      - 100% vertical support required.
     """
     L, W = pallet_size
     mask = np.zeros((2, L, W), dtype=bool)
-    rotations = [(0, 1, 2), (2, 1, 0)]  # must match env.get_rotated_box_dims
-
-    def axis_ok(support_mask, w, d, axis, max_gap_local):
-        # axis=0 → spanning along X (columns), need left & right edges touched
-        # axis=1 → spanning along Y (rows), need front & back edges touched
-        if axis == 0:
-            col_any = support_mask.any(axis=1)  # length w
-            edges = (col_any[0], col_any[-1])
-            if not (edges[0] and edges[1]):
-                return False
-            return _max_zero_run(col_any) <= max_gap_local
-        else:
-            row_any = support_mask.any(axis=0)  # length d
-            edges = (row_any[0], row_any[-1])
-            if not (edges[0] and edges[1]):
-                return False
-            return _max_zero_run(row_any) <= max_gap_local
+    rotations = [(0, 1, 2), (2, 1, 0)]
 
     for r_idx, rot in enumerate(rotations):
         l, w, h = (int(box_dims[rot[0]]), int(box_dims[rot[1]]), int(box_dims[rot[2]]))
@@ -116,70 +89,38 @@ def compute_gt_mask(
         for x in range(max_x + 1):
             for y in range(max_y + 1):
                 region = height_map[x:x + l, y:y + w]
-                base = np.max(region)
-                if base + h > max_height:
+                base_z = np.max(region)
+                if base_z + h > max_height:
                     continue
-
-                support_mask = (region == base)
-                support_count = int(support_mask.sum())
-                total = l * w
-                support_ratio = support_count / total if total > 0 else 0.0
-                if support_ratio < min_support_ratio:
+                # 60% support requirement
+                support_count = np.sum(region == base_z)
+                if (support_count / (l * w)) < 0.60:
                     continue
-
-                # Center of the footprint (index space 0..l-1, 0..w-1)
-                com_x = (l - 1) / 2.0
-                com_y = (w - 1) / 2.0
-                xs, ys = np.where(support_mask)
-                if xs.size == 0:
-                    continue
-                if not (xs.min() <= com_x <= xs.max() and ys.min() <= com_y <= ys.max()):
-                    # COM must lie within the span of supports (basic stability)
-                    continue
-
-                if require_opposite_edge_support:
-                    ok_x = axis_ok(support_mask, l, w, axis=0, max_gap_local=max_gap)
-                    ok_y = axis_ok(support_mask, l, w, axis=1, max_gap_local=max_gap)
-                    if not (ok_x or ok_y):
-                        continue
-
                 mask[r_idx, x, y] = True
 
-    # Filter mask by maximizing Average Maximal Space
-    # Identify all stable candidates
-    candidates = np.argwhere(mask) # (N, 3) -> (rot, x, y)
-    
+    # Filter mask by maximizing Average Maximal Space (Flatness)
+    candidates = np.argwhere(mask)
     if len(candidates) > 0:
         scores = []
         for rot, x, y in candidates:
             l, w, h = (int(box_dims[rotations[rot][0]]), int(box_dims[rotations[rot][1]]), int(box_dims[rotations[rot][2]]))
-            
-            # Simulate placement
             temp_hm = height_map.copy()
-            # Need to know placement base_z. 
-            # We must re-calculate base_z or trust it hasn't changed? 
-            # It's safer to re-calc quickly.
-            region = temp_hm[x:x+l, y:y+w]
-            base_z = np.max(region)
+            base_z = np.max(temp_hm[x:x+l, y:y+w])
             temp_hm[x:x+l, y:y+w] = base_z + h
-            
             score = calculate_average_flat_area(temp_hm)
             scores.append(score)
             
         scores = np.array(scores)
         max_score = np.max(scores)
-        
-        # Keep only those within small tolerance (float issues) or exact? 
-        # Exact is fine for discrete areas, but mean might be float.
-        # Let's use small tolerance.
         keep_indices = np.where(scores >= max_score - 1e-5)[0]
         
-        # Reset mask and only set keep_indices
         new_mask = np.zeros_like(mask)
         for idx in keep_indices:
             r, x, y = candidates[idx]
             new_mask[r, x, y] = True
         mask = new_mask
+
+    return mask
 
     return mask
 
@@ -192,33 +133,19 @@ class BoxPilingEnv:
         self,
         pallet_size=(10, 10),
         max_height=10,
-        # --- NEW BRIDGING PARAMS ---
-        min_support_ratio=0.50,
-        require_opposite_edge_support=True,
-        max_gap=2,
     ):
         self.pallet_size = pallet_size
         self.max_height = max_height
-        # VOXEL GRID: 0=Empty, 1=Occupied
-        self.voxels = np.zeros((pallet_size[0], pallet_size[1], max_height), dtype=int)
         
-        # Keep current_height_map for observation compatibility (Top-Down Projection)
         self.current_height_map = np.zeros(pallet_size)
-        
         self.current_box = None
         self.placed_boxes = []
-
-        # bridging params
-        self.min_support_ratio = float(min_support_ratio)
-        self.require_opposite_edge_support = bool(require_opposite_edge_support)
-        self.max_gap = int(max_gap)
 
         # metrics
         self.invalid_actions_learned = 0
         self.invalid_actions_attempted = 0
 
     def reset(self):
-        self.voxels = np.zeros((self.pallet_size[0], self.pallet_size[1], self.max_height), dtype=int)
         self.current_height_map = np.zeros(self.pallet_size)
         self.placed_boxes = []
         self.invalid_actions_learned = 0
@@ -240,83 +167,26 @@ class BoxPilingEnv:
 
     def _is_valid_placement(self, x, y, w, d, h):
         L, W, H = self.pallet_size[0], self.pallet_size[1], self.max_height
-        
-        # 1) Bounds
         if (x + w > L) or (y + d > W):
             return False, -1
-
-        # Search for lowest valid Z (Gravity)
-        # We start from z = 0 and go up.
-        # Box occupies [z, z+h]. Max valid z is H-h.
         
-        best_z = -1
+        # Standard Height Map Logic: Gravity check
+        region = self.current_height_map[x:x+w, y:y+d]
+        base_z = np.max(region)
         
-        # To optimize: find max height under the box footprint from 'current_height_map'?
-        # No, because now we can go UNDER boxes (overhangs).
-        # We must scan.
-        
-        for z in range(H - h + 1):
-            # Check Collision: Volume must be empty
-            # box volume: voxels[x:x+w, y:y+d, z:z+h]
-            if np.any(self.voxels[x:x+w, y:y+d, z:z+h]):
-                continue
-                
-            # Check REACHABILITY (Front-Loading from Y=0)
-            # Volume [x:x+w, 0:y, z:z+h] should be empty?
-            # Actually, standard pallet loading usually implies placing "behind" first?
-            # If Front is Y=0, we load from Y=0 towards Y=Max.
-            # So if we place at y=5, we need path from y=0..5 to be clear.
-            # Path Volume: [x:x+w, 0:y, z:z+h] must be empty.
-            if y > 0:
-                path_vol = self.voxels[x:x+w, 0:y, z:z+h]
-                if np.any(path_vol):
-                    continue
+        if base_z + h > H:
+            return False, -1
             
-            # Check Support (Gravity / Physics)
-            # If z=0, supported by floor.
-            # If z>0, need support from z-1.
-            if z > 0:
-                support_layer = self.voxels[x:x+w, y:y+d, z-1]
-                support_count = np.sum(support_layer)
-                support_ratio = support_count / (w * d)
-                
-                if support_ratio < self.min_support_ratio:
-                    continue
-                    
-                # Support spanning logic (bridging) applies to the support_layer
-                # ... (Simplified for Voxel: Ratio check is usually enough, but we keep spanning if strict)
-                if self.require_opposite_edge_support:
-                    # Check X-spanning
-                    col_any = np.any(support_layer, axis=1) # Length w
-                    ok_x = (col_any[0] and col_any[-1] and _max_zero_run(col_any) <= self.max_gap)
-                    
-                    # Check Y-spanning
-                    row_any = np.any(support_layer, axis=0) # Length d
-                    ok_y = (row_any[0] and row_any[-1] and _max_zero_run(row_any) <= self.max_gap)
-                    
-                    if not (ok_x or ok_y):
-                        continue
-                        
-                # Centroid check? Skipped for voxel simplicity unless requested.
-            
-            # If all checks pass, this z is valid. 
-            # Since we want lowest z (gravity), we return it immediately.
-            return True, z
-            
-        return False, -1
+        # 60% support requirement
+        support_count = np.sum(region == base_z)
+        if (support_count / (w * d)) < 0.60:
+             return False, -1
+             
+        return True, base_z
 
     def _update_height_map(self, x, y, w, d, h, z):
-        # Update Voxels
-        self.voxels[x:x+w, y:y+d, z:z+h] = 1
-        
-        # Update Height Map (Projection) - optional but good for observation
-        # Scan z from top
-        # Or just naive max:
-        # For region, set to max(old, z+h)? 
-        # No, because we might place *under*. Height map should represent *highest point*.
-        # So:
-        region = self.current_height_map[x:x+w, y:y+d]
-        self.current_height_map[x:x+w, y:y+d] = np.maximum(region, z+h)
+        # Update Height Map
+        self.current_height_map[x:x+w, y:y+d] = z + h
         return z
 
     # unchanged “maximal flat area”; reward still based on flatness.
@@ -347,11 +217,7 @@ class BoxPilingEnv:
         return max_area
 
     def _is_terminal(self):
-        # Terminal if full? Or just no space? RL usually runs until done or max steps.
-        # "Volume full" is a good check.
-        return np.all(self.voxels) # Highly unlikely to be 100% full.
-        # usually controlled by box stream end.
-        pass
+        return np.all(self.current_height_map >= self.max_height)
 
     def get_valid_actions(self, box_dims, pred_mask=None):
         """Uses predicted mask to prune, but final validity uses BRIDGING rule."""
@@ -430,12 +296,10 @@ class BoxPilingEnv:
             w, d, h = self.get_rotated_box_dims(self.current_box, rotation)
             valid, z = self._is_valid_placement(xx, yy, w, d, h)
             if valid:
-                # Calculate support in the layer below
-                # support_count = sum(voxels[... z-1])
-                if z == 0:
-                    support_count = w * d
-                else:
-                    support_count = np.sum(self.voxels[xx:xx+w, yy:yy+d, z-1])
+                # Calculate support in the layer below using height map
+                region = self.current_height_map[xx:xx+w, yy:yy+d]
+                # support_count is the number of cells that are exactly at base_z
+                support_count = np.sum(region == z)
                 
                 waste = (w * d - support_count)
                 gap = self.max_height - (z + h)
@@ -469,30 +333,22 @@ class BoxPilingEnv:
             if not valid:
                 continue
                 
-            # Count touching sides (3D Voxel Neighbors?)
-            # Simplified: Use 2.5D logic on the placement layer?
-            # Or count voxel faces?
-            # Let's stick to "Walls/Boxes" at the placement level `base_z`.
-            
             sides_touching = 0
-            # Scan perimeter at level base_z
-            # (Similar logic to before but checking voxels)
-            
             # West
             if xx == 0: sides_touching += 1
-            elif np.any(self.voxels[xx-1, yy:yy+d, base_z:base_z+h]): sides_touching += 1
+            elif np.any(self.current_height_map[xx-1, yy:yy+d] >= base_z): sides_touching += 1
             
             # East
             if xx + w == L: sides_touching += 1
-            elif np.any(self.voxels[xx+w, yy:yy+d, base_z:base_z+h]): sides_touching += 1
+            elif np.any(self.current_height_map[xx+w, yy:yy+d] >= base_z): sides_touching += 1
             
             # North
             if yy == 0: sides_touching += 1
-            elif np.any(self.voxels[xx:xx+w, yy-1, base_z:base_z+h]): sides_touching += 1
+            elif np.any(self.current_height_map[xx:xx+w, yy-1] >= base_z): sides_touching += 1
             
             # South
             if yy + d == W: sides_touching += 1
-            elif np.any(self.voxels[xx:xx+w, yy+d, base_z:base_z+h]): sides_touching += 1
+            elif np.any(self.current_height_map[xx:xx+w, yy+d] >= base_z): sides_touching += 1
             
             score = sides_touching * 100 - base_z
             if score > best_score:
@@ -555,12 +411,14 @@ class BoxPilingEnv:
         fig = plt.figure(figsize=(15, 8))
         ax = fig.add_subplot(111, projection='3d')
 
-        # Voxel Visualization
-        # self.voxels is (L, W, H)
-        ax.voxels(self.voxels, edgecolor='k', alpha=0.7)
+        # Individual Box Visualization
+        for i, (xx, yy, w, d, h, base_z) in enumerate(self.placed_boxes):
+            # Unique color per box using a colormap
+            color = plt.cm.tab20(i % 20)
+            ax.bar3d(xx, yy, base_z, w, d, h, color=color, edgecolor='black', alpha=0.8, linewidth=0.5)
 
         ax.set_title(
-            f"Episode {episode_num} - 3D Voxel Visualization\n"
+            f"Episode {episode_num} - 3D Box Visualization\n"
             f"Utilization: {utilization:.1%} | "
             f"Invalid Learned: {invalid_learned} | Invalid Attempted: {invalid_attempted}"
         )
@@ -588,7 +446,9 @@ class DQNAgent:
         # same bridging params for GT mask
         min_support_ratio=0.50,
         require_opposite_edge_support=True,
-        max_gap=2,
+        # min_support_ratio=0.50, # Removed bridging parameters
+        # require_opposite_edge_support=True, # Removed bridging parameters
+        # max_gap=2, # Removed bridging parameters
         learning_rate=0.001,
     ):
         self.state_dims = state_dims
@@ -597,10 +457,6 @@ class DQNAgent:
         self.learning_rate = learning_rate
 
         # store GT policy for mask supervision
-        self.min_support_ratio = float(min_support_ratio)
-        self.require_opposite_edge_support = bool(require_opposite_edge_support)
-        self.max_gap = int(max_gap)
-
         self.model = self._build_model()
         self.target_model = self._build_model()
 
@@ -708,14 +564,11 @@ class DQNAgent:
         tgt = torch.FloatTensor(rewards) + self.gamma * q_next * (1 - dones_t)
         q_loss = nn.MSELoss()(q_cur, tgt)
 
-        # GT masks using the SAME BRIDGING RULE
+        # GT masks using standard height map rule
         gt_list = []
         for hm_raw, bd_raw in zip(hm_s_raw, bd_s_raw):
             gt = compute_gt_mask(
                 hm_raw, bd_raw, pallet_size=(L, W), max_height=self.max_height,
-                min_support_ratio=self.min_support_ratio,
-                require_opposite_edge_support=self.require_opposite_edge_support,
-                max_gap=self.max_gap,
             )
             gt_list.append(gt.astype(np.float32))
         gt_masks = torch.from_numpy(np.stack(gt_list, 0))  # (B,2,L,W)
@@ -751,26 +604,15 @@ def train(
     episode_to_show=100,
     defer_penalty=-5.0,
     mask_bias_beta=0.5,
-    # expose bridging params here (env+agent share them)
-    min_support_ratio=0.50,
-    require_opposite_edge_support=True,
-    max_gap=2,
     learning_rate=0.001,
     max_buffer_size=float('inf'),
     return_agent=False,
 ):
-    env = BoxPilingEnv(
-        min_support_ratio=min_support_ratio,
-        require_opposite_edge_support=require_opposite_edge_support,
-        max_gap=max_gap,
-    )
+    env = BoxPilingEnv()
     agent = DQNAgent(
         state_dims={'height_map': env.pallet_size, 'box_dims': 3},
         action_size=5,
         max_height=env.max_height,
-        min_support_ratio=min_support_ratio,
-        require_opposite_edge_support=require_opposite_edge_support,
-        max_gap=max_gap,
         learning_rate=learning_rate,
     )
 
