@@ -320,7 +320,7 @@ if __name__ == "__main__":
     parser.add_argument("--all", action="store_true", help="Run all experiments")
     args = parser.parse_args()
     
-    base_output = "experiments_results"
+    base_output = "experiments_results_v2"
     
     if args.all:
         run_experiment_1(os.path.join(base_output, "exp1"), args.episodes, args.val_episodes)

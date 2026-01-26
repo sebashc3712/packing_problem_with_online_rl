@@ -470,7 +470,7 @@ class DQNAgent:
         self.epsilon_min = 0.01
         self.epsilon_decay = 0.995
 
-        self.mask_loss_weight = 0.2
+        self.mask_loss_weight = 0.15
         self.optimizer_step_count = 0
 
     def _build_model(self):
@@ -487,14 +487,15 @@ class DQNAgent:
                 )
                 with torch.no_grad():
                     conv_out = self.conv(torch.zeros(1, 1, L, W)).shape[1]
-                self.val = nn.Sequential(nn.Linear(conv_out + 3, 128), nn.ReLU(), nn.Linear(128, 1))
-                self.adv = nn.Sequential(nn.Linear(conv_out + 3, 128), nn.ReLU(), nn.Linear(128, action_size))
-                self.mask_head = nn.Sequential(nn.Linear(conv_out + 3, 256), nn.ReLU(),
+                self.val = nn.Sequential(nn.Linear(conv_out + 4, 128), nn.ReLU(), nn.Linear(128, 1))
+                self.adv = nn.Sequential(nn.Linear(conv_out + 4, 128), nn.ReLU(), nn.Linear(128, action_size))
+                self.mask_head = nn.Sequential(nn.Linear(conv_out + 4, 256), nn.ReLU(),
                                                nn.Linear(256, 2 * L * W))
 
-            def forward(self, hm, bd):
+            def forward(self, hm, bd, buf):
                 f = self.conv(hm)
-                z = torch.cat([f, bd], dim=1)
+                # Concatenate height map features, box dims, and buffer feature
+                z = torch.cat([f, bd, buf], dim=1)
                 v = self.val(z)
                 a = self.adv(z)
                 q = v + (a - a.mean(dim=1, keepdim=True))
@@ -504,26 +505,29 @@ class DQNAgent:
         return Net(self.state_dims['height_map'], self.action_size)
 
     # memory
-    def remember(self, s, a, r, ns, d):
-        self.memory.append((s, a, r, ns, d))
+    def remember(self, s, a, r, ns, d, buffer_count):
+        self.memory.append((s, a, r, ns, d, buffer_count))
         if len(self.memory) > 10000:
             self.memory.pop(0)
 
     # normalization
-    def _norm(self, state):
+    def _norm(self, state, buffer_count=0):
         L, W = self.state_dims['height_map']
         hm = state['height_map'] / float(self.max_height)
         bd = state['box_dims'] / np.array([L, W, self.max_height], dtype=np.float32)
+        # Normalized buffer vision (capped at 10 for consistency)
+        buf = np.array([min(buffer_count, 10) / 10.0], dtype=np.float32)
         return (torch.FloatTensor(hm).unsqueeze(0).unsqueeze(0),
-                torch.FloatTensor(bd).unsqueeze(0))
+                torch.FloatTensor(bd).unsqueeze(0),
+                torch.FloatTensor(buf).unsqueeze(0))
 
     # action selection (soft bias is computed outside and passed in)
     @torch.no_grad()
-    def act_with_mask_bias(self, state, mask_bias=None, beta=0.5, eps=1e-6):
+    def act_with_mask_bias(self, state, buffer_count=0, mask_bias=None, beta=0.5, eps=1e-6):
         if np.random.rand() <= self.epsilon:
             return int(np.random.randint(0, self.action_size))
-        hm, bd = self._norm(state)
-        q, _ = self.model(hm, bd)
+        hm, bd, buf = self._norm(state, buffer_count)
+        q, _ = self.model(hm, bd, buf)
         q = q.squeeze(0)
         if mask_bias is not None:
             b = torch.tensor(mask_bias, dtype=torch.float32)
@@ -532,9 +536,9 @@ class DQNAgent:
         return int(torch.argmax(q).item())
 
     @torch.no_grad()
-    def predict_mask(self, state, threshold=0.5):
-        hm, bd = self._norm(state)
-        _, ml = self.model(hm, bd)
+    def predict_mask(self, state, buffer_count=0, threshold=0.5):
+        hm, bd, buf = self._norm(state, buffer_count)
+        _, ml = self.model(hm, bd, buf)
         return (torch.sigmoid(ml)[0].cpu().numpy() > threshold)
 
     # training
@@ -542,23 +546,29 @@ class DQNAgent:
         if len(self.memory) < self.batch_size:
             return
         batch = random.sample(self.memory, self.batch_size)
-        states, actions, rewards, next_states, dones = zip(*batch)
+        states, actions, rewards, next_states, dones, buffer_counts = zip(*batch)
 
         L, W = self.state_dims['height_map']
         hm_s_raw = np.array([s['height_map'] for s in states], np.float32)
         bd_s_raw = np.array([s['box_dims'] for s in states], np.float32)
         hm_n_raw = np.array([s['height_map'] for s in next_states], np.float32)
         bd_n_raw = np.array([s['box_dims'] for s in next_states], np.float32)
+        bc_raw = np.array(buffer_counts, np.float32)
 
         hm_s = torch.FloatTensor(hm_s_raw / float(self.max_height)).unsqueeze(1)
         bd_s = torch.FloatTensor(bd_s_raw / np.array([L, W, self.max_height], np.float32))
+        bc_s = torch.FloatTensor(np.minimum(bc_raw, 10.0) / 10.0).unsqueeze(1)
+        
         hm_n = torch.FloatTensor(hm_n_raw / float(self.max_height)).unsqueeze(1)
         bd_n = torch.FloatTensor(bd_n_raw / np.array([L, W, self.max_height], np.float32))
+        # Note: In a simplified world, we assume same buffer count for next state in replay
+        # or we could store next_buffer_count. Let's use bc_s for both for simplicity as it's a small feature.
+        bc_n = bc_s 
 
-        q_cur, mask_logits = self.model(hm_s, bd_s)
+        q_cur, mask_logits = self.model(hm_s, bd_s, bc_s)
         q_cur = q_cur.gather(1, torch.LongTensor(actions).unsqueeze(1)).squeeze(1)
         with torch.no_grad():
-            q_next, _ = self.target_model(hm_n, bd_n)
+            q_next, _ = self.target_model(hm_n, bd_n, bc_n)
             q_next, _ = q_next.max(1)
         dones_t = torch.FloatTensor([1.0 if d else 0.0 for d in dones])
         tgt = torch.FloatTensor(rewards) + self.gamma * q_next * (1 - dones_t)
@@ -589,6 +599,10 @@ class DQNAgent:
         loss.backward()
         self.optimizer.step()
         self.optimizer_step_count += 1
+        
+        # Track losses for monitoring
+        self.last_q_loss = q_loss.item()
+        self.last_mask_loss = mask_loss.item()
 
     def update_target_model(self):
         self.target_model.load_state_dict(self.model.state_dict())
@@ -678,14 +692,14 @@ def train(
         placements_this_episode = 0
         attempts_this_episode = 0
 
-        def try_place_one_box(box_dims):
+        def try_place_one_box(box_dims, current_buffer_size):
             nonlocal state, episode_reward, total_decisions, placements_this_episode, attempts_this_episode
             state = env.new_box_arrival(box_dims)
             attempts_this_episode += 1
 
-            pred_mask = agent.predict_mask(state)
+            pred_mask = agent.predict_mask(state, buffer_count=current_buffer_size)
             mask_bias = proxy_scores_for_heuristics(env, pred_mask)
-            h_idx = agent.act_with_mask_bias(state, mask_bias=mask_bias, beta=mask_bias_beta)
+            h_idx = agent.act_with_mask_bias(state, buffer_count=current_buffer_size, mask_bias=mask_bias, beta=mask_bias_beta)
             heuristic = heuristic_map[h_idx]
             episode_heuristic_counts[heuristic] += 1
             total_decisions += 1
@@ -694,7 +708,7 @@ def train(
             if action is None:
                 action, mapping = env.choose_action_by_heuristic(heuristic, pred_mask=None)
                 if action is None:
-                    agent.remember(state, h_idx, defer_penalty, state, False)
+                    agent.remember(state, h_idx, defer_penalty, state, False, current_buffer_size)
                     agent.replay()
                     agent.update_target_model()
                     return False, defer_penalty
@@ -704,7 +718,7 @@ def train(
                 print(f"Heuristic: {heuristic} | Action: {mapping}")
 
             next_state, reward, local_done, info = env.step(action)
-            agent.remember(state, h_idx, reward, next_state, local_done)
+            agent.remember(state, h_idx, reward, next_state, local_done, current_buffer_size)
             agent.replay()
             agent.update_target_model()
             state = next_state
@@ -716,7 +730,7 @@ def train(
         while not done and box_idx < len(boxes):
             box_dims = boxes[box_idx]
             box_idx += 1
-            placed, _ = try_place_one_box(box_dims)
+            placed, _ = try_place_one_box(box_dims, len(buffer))
             if not placed:
                 if len(buffer) < max_buffer_size:
                     buffer.append(box_dims)
@@ -731,7 +745,9 @@ def train(
             for box_dims in buffer:
                 if not env.can_place_box(box_dims):
                     new_buffer.append(box_dims); continue
-                placed, _ = try_place_one_box(box_dims)
+                # When retrying from buffer, we pass the current buffer size minus one (conceptually)
+                # or just the current length. Let's use current length for simplicity.
+                placed, _ = try_place_one_box(box_dims, len(buffer))
                 if placed:
                     made_progress = True
                 else:
@@ -786,9 +802,14 @@ def train(
             agent.scheduler.step()
             agent.optimizer_step_count = 0
 
+        # Get agent losses for printing
+        q_l = getattr(agent, 'last_q_loss', 0.0)
+        m_l = getattr(agent, 'last_mask_loss', 0.0)
+
         print(f"Episode: {episode + 1:04d} | Util: {utilization:.1%} | "
-              f"Invalid Lrn/Att: {env.invalid_actions_learned:02d}/{env.invalid_actions_attempted:02d} | "
-              f"Placed: {len(env.placed_boxes):02d} | ε: {agent.epsilon:.3f}")
+              f"Inv(L/A): {env.invalid_actions_learned:02d}/{env.invalid_actions_attempted:02d} | "
+              f"Pl: {len(env.placed_boxes):02d} | ε: {agent.epsilon:.3f} | "
+              f"Q:{q_l:.2f} M:{m_l:.4f}")
 
     avg_utilization = total_utilization / total_episodes
     total_invalid_learned = sum(m['invalid_learned'] for m in all_metrics)

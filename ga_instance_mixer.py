@@ -9,9 +9,9 @@ def generate_ga_mixed_instances(
     elite_frac: float = 0.10,
     mutation_reorder_p: float = 0.15,
     mutation_switch_p: float = 0.10,
-    mutation_dim_p: float = 0.05,
-    target_fill: float = 0.80,
-    alpha_diversity: float = 0.15,
+    mutation_dim_p: float = 0.08,
+    target_fill: float = 0.85,
+    alpha_diversity: float = 0.12,
     keep_episode_lengths: bool = True,
     n_output_episodes: int = 3000,
     random_seed: int = 42
@@ -116,14 +116,22 @@ def generate_ga_mixed_instances(
             j = random.randrange(len(population[b]))
             population[a][i], population[b][j] = population[b][j], population[a][i]
 
-    def mutate_dimensions(ep, dim_min, dim_max, p_dim=0.05):
+    def mutate_dimensions(ep, dim_min, dim_max, p_dim=0.08):
         for k in range(len(ep)):
             if random.random() < p_dim:
                 x,y,z = ep[k]
                 idx = random.randrange(3)
-                if idx == 0: x += random.choice([-1,1])
-                elif idx == 1: y += random.choice([-1,1])
-                else: z += random.choice([-1,1])
+                
+                # Hard mutation: occasionally jump to large dims
+                if random.random() < 0.1:
+                    if idx == 0: x = random.randint(3, 7)
+                    elif idx == 1: y = random.randint(3, 7)
+                    else: z = random.randint(2, 5)
+                else:
+                    if idx == 0: x += random.choice([-1,1])
+                    elif idx == 1: y += random.choice([-1,1])
+                    else: z += random.choice([-1,1])
+                
                 x = max(dim_min[0], min(dim_max[0], x))
                 y = max(dim_min[1], min(dim_max[1], y))
                 z = max(dim_min[2], min(dim_max[2], z))
@@ -251,8 +259,8 @@ summary = generate_ga_mixed_instances(
     population_size=2000,
     n_output_episodes=3000,
     keep_episode_lengths=True,
-    target_fill=0.80,
-    alpha_diversity=0.15,
+    target_fill=0.85,
+    alpha_diversity=0.12,
     random_seed=42
 )
 print(summary)
