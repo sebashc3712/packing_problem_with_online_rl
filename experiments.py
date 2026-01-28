@@ -156,7 +156,7 @@ def load_instances(path):
         with open(path, 'rb') as f:
             return pickle.load(f)
 
-def run_experiment_1(output_dir, train_episodes=2100, val_episodes=None):
+def run_experiment_1(output_dir, train_episodes=10000, val_episodes=None):
     print("\n=== Experiment 1: Learning Strategy Confirmation ===")
     os.makedirs(output_dir, exist_ok=True)
     
@@ -174,7 +174,7 @@ def run_experiment_1(output_dir, train_episodes=2100, val_episodes=None):
     # Train
     print(f"Training on artificial instances ({len(train_data)} available)...")
     # Using specific episodes count or full
-    train_subset = train_data[:train_episodes] if train_episodes < len(train_data) else train_data
+    train_subset = train_data[:train_episodes] if train_episodes and train_episodes < len(train_data) else train_data
     # Shuffle to remove GA's fitness-based ordering bias (critical for fair training)
     import random
     train_subset = list(train_subset)
@@ -211,7 +211,7 @@ def run_experiment_1(output_dir, train_episodes=2100, val_episodes=None):
     })
     results.to_csv(os.path.join(output_dir, "validation_results.csv"), index=False)
 
-def run_experiment_2(output_dir, train_episodes=2100, val_episodes=None):
+def run_experiment_2(output_dir, train_episodes=10000, val_episodes=None):
     print("\n=== Experiment 2: Buffer Size Comparison ===")
     os.makedirs(output_dir, exist_ok=True)
     
@@ -233,7 +233,7 @@ def run_experiment_2(output_dir, train_episodes=2100, val_episodes=None):
         run_name = f"buffer_{buf}"
         
         # Train
-        train_subset = train_data[:train_episodes]
+        train_subset = train_data[:train_episodes] if train_episodes and train_episodes < len(train_data) else train_data
         # Shuffle to remove GA's fitness-based ordering bias
         import random
         train_subset = list(train_subset)
@@ -269,7 +269,7 @@ def run_experiment_2(output_dir, train_episodes=2100, val_episodes=None):
     print("\nBuffer Experiment Summary:")
     print(df)
 
-def run_experiment_3(output_dir, train_episodes=2100, val_episodes=None):
+def run_experiment_3(output_dir, train_episodes=10000, val_episodes=None):
     print("\n=== Experiment 3: Learning Rate Comparison ===")
     os.makedirs(output_dir, exist_ok=True)
     
@@ -290,7 +290,7 @@ def run_experiment_3(output_dir, train_episodes=2100, val_episodes=None):
         print(f"\n--- Testing Learning Rate: {lr} ---")
         run_name = f"lr_{lr}"
         
-        train_subset = train_data[:train_episodes]
+        train_subset = train_data[:train_episodes] if train_episodes and train_episodes < len(train_data) else train_data
         # Shuffle to remove GA's fitness-based ordering bias
         import random
         train_subset = list(train_subset)
@@ -329,7 +329,7 @@ def run_experiment_3(output_dir, train_episodes=2100, val_episodes=None):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--exp", type=int, choices=[1, 2, 3], help="Experiment number (1, 2, or 3)")
-    parser.add_argument("--episodes", type=int, default=2100, help="Number of training episodes")
+    parser.add_argument("--episodes", type=int, default=10000, help="Number of training episodes")
     parser.add_argument("--val-episodes", type=int, default=None, help="Number of validation episodes")
     parser.add_argument("--all", action="store_true", help="Run all experiments")
     args = parser.parse_args()

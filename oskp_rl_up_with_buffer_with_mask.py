@@ -688,12 +688,16 @@ def train(
         episode_reward = 0
         episode_heuristic_counts = {k: 0 for k in heuristic_map.values()}
         total_decisions = 0
-        buffer = []
         placements_this_episode = 0
         attempts_this_episode = 0
+        buffer = []
+        
+        # Track losses per episode
+        episode_q_losses = []
+        episode_mask_losses = []
 
         def try_place_one_box(box_dims, current_buffer_size):
-            nonlocal state, episode_reward, total_decisions, placements_this_episode, attempts_this_episode
+            nonlocal state, episode_reward, total_decisions, placements_this_episode, attempts_this_episode, episode_q_losses, episode_mask_losses
             state = env.new_box_arrival(box_dims)
             attempts_this_episode += 1
 
@@ -710,6 +714,11 @@ def train(
                 if action is None:
                     agent.remember(state, h_idx, defer_penalty, state, False, current_buffer_size)
                     agent.replay()
+                    
+                    # Store step losses
+                    if hasattr(agent, 'last_q_loss'): episode_q_losses.append(agent.last_q_loss)
+                    if hasattr(agent, 'last_mask_loss'): episode_mask_losses.append(agent.last_mask_loss)
+                    
                     # Target network updated once per episode, not here
                     return False, defer_penalty
 
@@ -720,6 +729,11 @@ def train(
             next_state, reward, local_done, info = env.step(action)
             agent.remember(state, h_idx, reward, next_state, local_done, current_buffer_size)
             agent.replay()
+            
+            # Store step losses
+            if hasattr(agent, 'last_q_loss'): episode_q_losses.append(agent.last_q_loss)
+            if hasattr(agent, 'last_mask_loss'): episode_mask_losses.append(agent.last_mask_loss)
+            
             # Target network updated once per episode, not here
             state = next_state
             episode_reward += reward
@@ -785,6 +799,8 @@ def train(
             'perc_semi_perfect_fit': perc['semi_perfect_fit'],
             'perc_random_fit': perc['random_fit'],
             'perc_corner': perc['corner'],
+            'avg_q_loss': np.mean(episode_q_losses) if episode_q_losses else 0.0,
+            'avg_mask_loss': np.mean(episode_mask_losses) if episode_mask_losses else 0.0
         })
 
         if (episode + 1) % 100 == 0:
@@ -867,6 +883,38 @@ def train(
     plt.grid(True)
     if output_dir:
         plt.savefig(os.path.join(output_dir, 'utilization_trend.png'))
+    plt.close()
+    
+    # loss trend plot
+    plt.figure(figsize=(12, 6))
+    q_losses = [r['avg_q_loss'] for r in rows]
+    m_losses = [r['avg_mask_loss'] for r in rows]
+    
+    ax1 = plt.gca()
+    ax2 = ax1.twinx()
+    
+    p1, = ax1.plot(episodes_x, q_losses, label='Q-Loss', color='blue', alpha=0.4)
+    p2, = ax2.plot(episodes_x, m_losses, label='Mask-Loss', color='green', alpha=0.4)
+    
+    # moving averages
+    if len(q_losses) >= w:
+        q_ma = pd.Series(q_losses).rolling(window=w).mean()
+        m_ma = pd.Series(m_losses).rolling(window=w).mean()
+        ax1.plot(episodes_x, q_ma, color='blue', linewidth=2, label=f'Q-Loss MA({w})')
+        ax2.plot(episodes_x, m_ma, color='green', linewidth=2, label=f'Mask-Loss MA({w})')
+        
+    ax1.set_xlabel('Episode')
+    ax1.set_ylabel('Q-Loss (MSE)', color='blue')
+    ax2.set_ylabel('Mask-Loss (BCE)', color='green')
+    plt.title('Training Loss Evolution')
+    
+    # combined legend
+    ax1.legend(loc='upper right')
+    ax2.legend(loc='lower right')
+    
+    plt.grid(True)
+    if output_dir:
+        plt.savefig(os.path.join(output_dir, 'loss_trend.png'))
     plt.close()
     
     if return_agent:
