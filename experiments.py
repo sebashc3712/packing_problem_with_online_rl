@@ -175,6 +175,10 @@ def run_experiment_1(output_dir, train_episodes=2100, val_episodes=None):
     print(f"Training on artificial instances ({len(train_data)} available)...")
     # Using specific episodes count or full
     train_subset = train_data[:train_episodes] if train_episodes < len(train_data) else train_data
+    # Shuffle to remove GA's fitness-based ordering bias (critical for fair training)
+    import random
+    train_subset = list(train_subset)
+    random.shuffle(train_subset)
     
     train_out_dir = os.path.join(output_dir, "train_ga_mixed")
     os.makedirs(train_out_dir, exist_ok=True)
@@ -230,6 +234,11 @@ def run_experiment_2(output_dir, train_episodes=2100, val_episodes=None):
         
         # Train
         train_subset = train_data[:train_episodes]
+        # Shuffle to remove GA's fitness-based ordering bias
+        import random
+        train_subset = list(train_subset)
+        random.shuffle(train_subset)
+        
         train_out_dir = os.path.join(output_dir, f"train_{run_name}")
         os.makedirs(train_out_dir, exist_ok=True)
         metrics, agent = train(
@@ -282,6 +291,11 @@ def run_experiment_3(output_dir, train_episodes=2100, val_episodes=None):
         run_name = f"lr_{lr}"
         
         train_subset = train_data[:train_episodes]
+        # Shuffle to remove GA's fitness-based ordering bias
+        import random
+        train_subset = list(train_subset)
+        random.shuffle(train_subset)
+        
         train_out_dir = os.path.join(output_dir, f"train_{run_name}")
         os.makedirs(train_out_dir, exist_ok=True)
         metrics, agent = train(

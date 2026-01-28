@@ -461,13 +461,13 @@ class DQNAgent:
         self.target_model = self._build_model()
 
         self.optimizer = optim.RMSprop(self.model.parameters(), lr=self.learning_rate)
-        self.scheduler = torch.optim.lr_scheduler.ExponentialLR(self.optimizer, gamma=0.99)
+        # Using constant learning rate (no scheduler) to prevent decay and preserve LR experiment integrity
 
         self.memory = []
         self.batch_size = 32
         self.gamma = 0.95
         self.epsilon = 1.0
-        self.epsilon_min = 0.01
+        self.epsilon_min = 0.05  # Increased from 0.01 to maintain 5% exploration
         self.epsilon_decay = 0.995
 
         self.mask_loss_weight = 0.15
@@ -710,7 +710,7 @@ def train(
                 if action is None:
                     agent.remember(state, h_idx, defer_penalty, state, False, current_buffer_size)
                     agent.replay()
-                    agent.update_target_model()
+                    # Target network updated once per episode, not here
                     return False, defer_penalty
 
             if verbose and episode == episode_to_show:
@@ -720,7 +720,7 @@ def train(
             next_state, reward, local_done, info = env.step(action)
             agent.remember(state, h_idx, reward, next_state, local_done, current_buffer_size)
             agent.replay()
-            agent.update_target_model()
+            # Target network updated once per episode, not here
             state = next_state
             episode_reward += reward
             placements_this_episode += 1
@@ -798,9 +798,9 @@ def train(
             )
 
         agent.epsilon = max(agent.epsilon_min, agent.epsilon * agent.epsilon_decay)
-        if agent.optimizer_step_count > 0:
-            agent.scheduler.step()
-            agent.optimizer_step_count = 0
+        
+        # Update target network ONCE per episode (critical for stable Q-learning)
+        agent.update_target_model()
 
         # Get agent losses for printing
         q_l = getattr(agent, 'last_q_loss', 0.0)
