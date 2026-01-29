@@ -325,10 +325,63 @@ def run_experiment_3(output_dir, train_episodes=10000, val_episodes=None):
     print("\nLearning Rate Experiment Summary:")
     print(df)
 
+def run_paper_experiment(output_dir, train_episodes=10000, val_episodes=None):
+    print("\n=== Paper Experiment: Buffer=3, LR=0.0001 ===")
+    os.makedirs(output_dir, exist_ok=True)
+    
+    # Load Data
+    train_data = load_instances("approachesO3DKP/ga_mixed.pt")
+    val_cut1 = load_instances("approachesO3DKP/cut_1.pt")
+    val_cut2 = load_instances("approachesO3DKP/cut_2.pt")
+    val_rs = load_instances("approachesO3DKP/rs.pt")
+    
+    if val_episodes:
+        val_cut1 = val_cut1[:val_episodes]
+        val_cut2 = val_cut2[:val_episodes]
+        val_rs = val_rs[:val_episodes]
+    
+    # Train
+    train_subset = train_data[:train_episodes] if train_episodes and train_episodes < len(train_data) else train_data
+    import random
+    train_subset = list(train_subset)
+    random.shuffle(train_subset)
+    
+    train_out_dir = os.path.join(output_dir, "train_log")
+    os.makedirs(train_out_dir, exist_ok=True)
+    
+    metrics, agent = train(
+        train_subset, 
+        output_dir=train_out_dir,
+        return_agent=True,
+        learning_rate=0.0001,
+        max_buffer_size=3
+    )
+    
+    # Validate
+    print("Validating...")
+    env_params = {'max_buffer_size': 3}
+    
+    score_cut1 = evaluate(agent, val_cut1, env_params)
+    score_cut2 = evaluate(agent, val_cut2, env_params)
+    score_rs = evaluate(agent, val_rs, env_params)
+    
+    print(f"Validation Results (Utilization):")
+    print(f"  CUT-1: {score_cut1:.2%}")
+    print(f"  CUT-2: {score_cut2:.2%}")
+    print(f"  RS:    {score_rs:.2%}")
+    
+    # Save results
+    results = pd.DataFrame({
+        'Dataset': ['CUT-1', 'CUT-2', 'RS'],
+        'Utilization': [score_cut1, score_cut2, score_rs],
+        'Config': ['Buffer=3, LR=0.0001', 'Buffer=3, LR=0.0001', 'Buffer=3, LR=0.0001']
+    })
+    results.to_csv(os.path.join(output_dir, "validation_results.csv"), index=False)
+
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--exp", type=int, choices=[1, 2, 3], help="Experiment number (1, 2, or 3)")
+    parser.add_argument("--exp", type=int, choices=[1, 2, 3, 4], help="Experiment number (1, 2, 3, or 4)")
     parser.add_argument("--episodes", type=int, default=10000, help="Number of training episodes")
     parser.add_argument("--val-episodes", type=int, default=None, help="Number of validation episodes")
     parser.add_argument("--all", action="store_true", help="Run all experiments")
@@ -346,5 +399,7 @@ if __name__ == "__main__":
         run_experiment_2(os.path.join(base_output, "exp2"), args.episodes, args.val_episodes)
     elif args.exp == 3:
         run_experiment_3(os.path.join(base_output, "exp3"), args.episodes, args.val_episodes)
+    elif args.exp == 4:
+        run_paper_experiment("paper experiments", args.episodes, args.val_episodes)
     else:
-        print("Please specify --exp [1,2,3] or --all")
+        print("Please specify --exp [1,2,3,4] or --all")
