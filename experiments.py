@@ -471,13 +471,13 @@ def run_experiment_6(output_dir, train_episodes=10000, val_episodes=None):
             model_save_path=os.path.join(models_dir, f"dqn_{run_name}.pt"),
             max_buffer_size=buf,
             learning_rate=0.005,
-            min_support_ratio=0.50, # Ensure consistent physics
+            min_support_ratio=0.60, # Ensure consistent physics
             require_opposite_edge_support=True
         )
         
         # Validate
         print(f"Evaluating Buffer Size {buf} on Test Sets...")
-        env_params = {'max_buffer_size': buf, 'min_support_ratio': 0.50, 'require_opposite_edge_support': True}
+        env_params = {'max_buffer_size': buf, 'min_support_ratio': 0.60, 'require_opposite_edge_support': True}
         s_cut1 = evaluate(agent, val_cut1, env_params)
         s_cut2 = evaluate(agent, val_cut2, env_params)
         s_rs = evaluate(agent, val_rs, env_params)
@@ -537,7 +537,7 @@ def run_experiment_7(output_dir, train_episodes=10000, val_episodes=None):
             model_save_path=os.path.join(models_dir, f"dqn_{run_name}.pt"),
             learning_rate=lr,
             max_buffer_size=0,
-            min_support_ratio=0.50,
+            min_support_ratio=0.60,
             require_opposite_edge_support=True
         )
         
@@ -563,9 +563,141 @@ def run_experiment_7(output_dir, train_episodes=10000, val_episodes=None):
     print(pd.DataFrame(results))
 
 
+def run_final_best_config_experiment(output_dir, train_episodes=10000, val_episodes=None):
+    print("\n=== Experiment 8: Final Best Configuration (Buffer=2, LR=0.0001) ===")
+    os.makedirs(output_dir, exist_ok=True)
+    
+    # Load Data
+    train_data = load_instances("approachesO3DKP/ga_mixed.pt")
+    val_cut1 = load_instances("approachesO3DKP/cut_1.pt")
+    val_cut2 = load_instances("approachesO3DKP/cut_2.pt")
+    val_rs = load_instances("approachesO3DKP/rs.pt")
+
+    if val_episodes:
+        val_cut1 = val_cut1[:val_episodes]
+        val_cut2 = val_cut2[:val_episodes]
+        val_rs = val_rs[:val_episodes]
+    
+    # Prepare Train Subset
+    train_subset = train_data[:train_episodes] if train_episodes and train_episodes < len(train_data) else train_data
+    import random
+    train_subset = list(train_subset)
+    random.shuffle(train_subset)
+
+    models_dir = os.path.join(output_dir, "models")
+    os.makedirs(models_dir, exist_ok=True)
+    results_csv = os.path.join(output_dir, "final_best_config_results.csv")
+
+    print(f"\n--- Training with Buffer Size: 2, LR: 0.0001 ---")
+    
+    train_out_dir = os.path.join(output_dir, "train_best_config")
+    os.makedirs(train_out_dir, exist_ok=True)
+    
+    metrics, agent = train(
+        train_subset,
+        output_dir=train_out_dir,
+        return_agent=True,
+        model_save_path=os.path.join(models_dir, "dqn_best_config_b2_lr0001.pt"),
+        max_buffer_size=2,
+        learning_rate=0.0001,
+        min_support_ratio=0.60,
+        require_opposite_edge_support=True
+    )
+    
+    # Validate
+    print(f"Evaluating Final Model on Test Sets...")
+    env_params = {'max_buffer_size': 2, 'min_support_ratio': 0.50, 'require_opposite_edge_support': True}
+    s_cut1 = evaluate(agent, val_cut1, env_params)
+    s_cut2 = evaluate(agent, val_cut2, env_params)
+    s_rs = evaluate(agent, val_rs, env_params)
+    
+    print(f"  Final Results -> CUT1: {s_cut1:.1%}, CUT2: {s_cut2:.1%}, RS: {s_rs:.1%}")
+    
+    result = {
+        'buffer_size': 2,
+        'lr': 0.0001,
+        'cut1': s_cut1,
+        'cut2': s_cut2,
+        'rs': s_rs
+    }
+    pd.DataFrame([result]).to_csv(results_csv, index=False)
+    
+    print("\nExperiment 8 Final Summary:")
+    print(result)
+
+def grid_search(output_dir, train_episodes=10000, val_episodes=None):
+    print("\n=== Experiment 9: Grid Search ===")
+    os.makedirs(output_dir, exist_ok=True)
+    
+    train_data = load_instances("approachesO3DKP/ga_mixed.pt")
+    val_cut1 = load_instances("approachesO3DKP/cut_1.pt")
+    val_cut2 = load_instances("approachesO3DKP/cut_2.pt")
+    val_rs = load_instances("approachesO3DKP/rs.pt")
+
+    if val_episodes:
+        val_cut1 = val_cut1[:val_episodes]
+        val_cut2 = val_cut2[:val_episodes]
+        val_rs = val_rs[:val_episodes]
+
+    # Prepare Train Subset
+    train_subset = train_data[:train_episodes] if train_episodes and train_episodes < len(train_data) else train_data
+    import random
+    train_subset = list(train_subset)
+    random.shuffle(train_subset)
+
+    lrs = [0.0001, 0.001, 0.005] 
+    buffer_sizes = [0, 1, 2, 3, 4]
+    results = []
+    
+    models_dir = os.path.join(output_dir, "models")
+    os.makedirs(models_dir, exist_ok=True)
+    results_csv = os.path.join(output_dir, "exp9_grid_search_results.csv")
+
+    for lr in lrs:
+        for buffer_size in buffer_sizes:
+            print(f"\n--- Testing LR: {lr} (Buffer Size: {buffer_size}) ---")
+            run_name = f"lr_{lr}_buffer_{buffer_size}"
+        
+            train_out_dir = os.path.join(output_dir, f"train_{run_name}")
+            os.makedirs(train_out_dir, exist_ok=True)
+        
+            metrics, agent = train(
+                train_subset,
+                output_dir=train_out_dir,
+                return_agent=True,
+                model_save_path=os.path.join(models_dir, f"dqn_{run_name}.pt"),
+                learning_rate=lr,
+                max_buffer_size=buffer_size,
+                min_support_ratio=0.60,
+                require_opposite_edge_support=True
+            )
+        
+            # Validate
+            print(f"Evaluating LR={lr} on Test Sets...")
+            env_params = {'max_buffer_size': buffer_size, 'min_support_ratio': 0.60, 'require_opposite_edge_support': True}
+            s_cut1 = evaluate(agent, val_cut1, env_params)
+            s_cut2 = evaluate(agent, val_cut2, env_params)
+            s_rs = evaluate(agent, val_rs, env_params)
+            
+            print(f"  LR={lr} (Buffer Size: {buffer_size}) -> CUT1: {s_cut1:.1%}, CUT2: {s_cut2:.1%}, RS: {s_rs:.1%}")
+            results.append({
+                'lr': lr,
+                'buffer_size': buffer_size,
+                'cut1': s_cut1,
+                'cut2': s_cut2,
+                'rs': s_rs
+            })
+            # Incremental Save
+            pd.DataFrame(results).to_csv(results_csv, index=False)
+        
+    print("\nExperiment 9 Final Summary:")
+    print(pd.DataFrame(results))
+    
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--exp", type=int, choices=[5, 6, 7], default=5, help="Experiment number (5=Buf vs NoBuf, 6=Buf Sizes LR 0.005, 7=LRs NoBuf)")
+    parser.add_argument("--exp", type=int, choices=[5, 6, 7, 8, 9], default=9, help="Experiment number")
     parser.add_argument("--episodes", type=int, default=10000, help="Number of training episodes")
     parser.add_argument("--val-episodes", type=int, default=None, help="Number of validation episodes")
     args = parser.parse_args()
@@ -578,5 +710,9 @@ if __name__ == "__main__":
         run_experiment_6(os.path.join(base_output, "exp6_buffer_lr_005"), args.episodes, args.val_episodes)
     elif args.exp == 7:
         run_experiment_7(os.path.join(base_output, "exp7_lr_nobuffer"), args.episodes, args.val_episodes)
+    elif args.exp == 8:
+        run_final_best_config_experiment(os.path.join(base_output, "exp8_final_best"), args.episodes, args.val_episodes)
+    elif args.exp == 9:
+        grid_search(os.path.join(base_output, "exp9_grid_search"), args.episodes, args.val_episodes)
     else:
-        print("Use --exp 5, 6, or 7.")
+        print("Use --exp 5, 6, 7, 8, or 9.")
