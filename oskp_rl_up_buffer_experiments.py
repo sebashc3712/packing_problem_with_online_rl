@@ -67,18 +67,20 @@ def compute_gt_mask(
     max_height=10,
 ):
     """
-    Returns a boolean mask of shape (2, L, W), one channel per rotation:
+    Returns a continuous mask of shape (2, L, W), one channel per rotation:
       rot 0: (l, w, h)
       rot 1: (h, w, l)
     
-    Standard Height Map Rule:
-      - The box rests at base_z = max(placement_area).
-      - Height limit: base_z + h <= max_height
-      - 100% vertical support required.
+    Values are normalized flatness scores (0 to 1):
+      - 0 = invalid placement
+      - 0.5 to 1.0 = valid, scaled by relative flatness quality
     """
     L, W = pallet_size
-    mask = np.zeros((2, L, W), dtype=bool)
+    mask = np.zeros((2, L, W), dtype=np.float32)
     rotations = [(0, 1, 2), (2, 1, 0)]
+    
+    # First pass: find all valid positions and their flatness scores
+    valid_positions = []
 
     for r_idx, rot in enumerate(rotations):
         l, w, h = (int(box_dims[rot[0]]), int(box_dims[rot[1]]), int(box_dims[rot[2]]))
@@ -99,29 +101,26 @@ def compute_gt_mask(
                 support_count = np.sum(region == base_z)
                 if (support_count / (l * w)) < 0.60:
                     continue
-                mask[r_idx, x, y] = True
+                
+                # Compute flatness score for this placement
+                temp_hm = height_map.copy()
+                temp_hm[x:x+l, y:y+w] = base_z + h
+                flatness = calculate_average_flat_area(temp_hm)
+                valid_positions.append((r_idx, x, y, flatness))
 
-    # Filter mask by maximizing Average Maximal Space (Flatness)
-    candidates = np.argwhere(mask)
-    if len(candidates) > 0:
-        scores = []
-        for rot, x, y in candidates:
-            l, w, h = (int(box_dims[rotations[rot][0]]), int(box_dims[rotations[rot][1]]), int(box_dims[rotations[rot][2]]))
-            temp_hm = height_map.copy()
-            base_z = np.max(temp_hm[x:x+l, y:y+w])
-            temp_hm[x:x+l, y:y+w] = base_z + h
-            score = calculate_average_flat_area(temp_hm)
-            scores.append(score)
-            
-        scores = np.array(scores)
-        max_score = np.max(scores)
-        keep_indices = np.where(scores >= max_score - 1e-5)[0]
+    # Second pass: normalize scores and populate mask
+    if len(valid_positions) > 0:
+        scores = np.array([pos[3] for pos in valid_positions])
+        min_score = scores.min()
+        max_score = scores.max()
         
-        new_mask = np.zeros_like(mask)
-        for idx in keep_indices:
-            r, x, y = candidates[idx]
-            new_mask[r, x, y] = True
-        mask = new_mask
+        for r_idx, x, y, flatness in valid_positions:
+            if max_score - min_score > 1e-6:
+                # Normalize to [0.5, 1.0] range
+                normalized = 0.5 + 0.5 * (flatness - min_score) / (max_score - min_score)
+            else:
+                normalized = 1.0
+            mask[r_idx, x, y] = normalized
 
     return mask
 
@@ -468,7 +467,7 @@ class DQNAgent:
         self.batch_size = 32
         self.gamma = 0.95
         self.epsilon = 1.0
-        self.epsilon_min = 0.05  # Increased from 0.01 to maintain 5% exploration
+        self.epsilon_min = 0.05
         self.epsilon_decay = 0.995
 
         self.mask_loss_weight = 0.15
@@ -602,13 +601,9 @@ class DQNAgent:
         # Skip samples without a box
         has_box = torch.from_numpy((bd_s_raw.sum(axis=1) > 0).astype(np.float32)).to(self.device)
 
-        pos = gt_masks.sum()
-        neg = gt_masks.numel() - pos
-        # Careful with clamp and weight on device
-        pos_weight = (neg / (pos + 1e-6)).clamp_(1, 50) # scalar check
-        
-        bce = nn.BCEWithLogitsLoss(pos_weight=pos_weight, reduction='none')
-        per_elem = bce(mask_logits, gt_masks)
+        # Use MSE loss for continuous mask targets (flatness scores)
+        mask_preds = torch.sigmoid(mask_logits)
+        per_elem = (mask_preds - gt_masks) ** 2
         per_sample = per_elem.mean(dim=(1, 2, 3))
         mask_loss = (per_sample * has_box).sum() / (has_box.sum() + 1e-6)
 
@@ -813,7 +808,6 @@ def train(
             placements_this_episode += 1
             return True, reward
 
-        # initial stream
         while not done and box_idx < len(boxes):
             box_dims = boxes[box_idx]
             box_idx += 1
@@ -821,6 +815,10 @@ def train(
             if not placed:
                 if len(buffer) < max_buffer_size:
                     buffer.append(box_dims)
+                else:
+                    # Cannot place AND cannot buffer → end episode
+                    done = True
+                    break
             if env._is_terminal():
                 done = True
                 break
@@ -840,6 +838,10 @@ def train(
                 else:
                     if len(new_buffer) < max_buffer_size:
                         new_buffer.append(box_dims)
+                    else:
+                        # Buffer full and cannot place → end episode
+                        done = True
+                        break
                 if env._is_terminal():
                     done = True; break
             buffer = new_buffer

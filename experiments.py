@@ -66,6 +66,10 @@ def evaluate(agent, episodes_boxes, env_params):
             if not placed:
                 if len(buffer) < max_buffer_size:
                     buffer.append(box_dims)
+                else:
+                    # Cannot place AND cannot buffer → end episode
+                    done = True
+                    break
             
             if env._is_terminal():
                 done = True
@@ -99,6 +103,10 @@ def evaluate(agent, episodes_boxes, env_params):
                 else:
                     if len(new_buffer) < max_buffer_size:
                         new_buffer.append(box_dims)
+                    else:
+                        # Buffer full and cannot place → end episode
+                        done = True
+                        break
                 
                 if env._is_terminal():
                     done = True; break
@@ -694,12 +702,234 @@ def grid_search(output_dir, train_episodes=10000, val_episodes=None):
     print(pd.DataFrame(results))
     
 
+def run_epoch_training(output_dir, train_episodes=10000, val_episodes=None, patience=3, max_epochs=20):
+    """
+    Experiment 10: Epoch-based training with early stopping.
+    Trains for multiple epochs until validation utilization stabilizes.
+    """
+    print(f"\n=== Experiment 10: Epoch-Based Training (Buffer=0, LR=0.001) ===")
+    print(f"    Max Epochs: {max_epochs}, Patience: {patience}")
+    os.makedirs(output_dir, exist_ok=True)
+    
+    # Load Data
+    train_data = load_instances("approachesO3DKP/ga_mixed.pt")
+    val_cut1 = load_instances("approachesO3DKP/cut_1.pt")
+    val_cut2 = load_instances("approachesO3DKP/cut_2.pt")
+    val_rs = load_instances("approachesO3DKP/rs.pt")
+
+    if val_episodes:
+        val_cut1 = val_cut1[:val_episodes]
+        val_cut2 = val_cut2[:val_episodes]
+        val_rs = val_rs[:val_episodes]
+    
+    # Prepare Train Subset
+    train_subset = train_data[:train_episodes] if train_episodes and train_episodes < len(train_data) else train_data
+    train_subset = list(train_subset)
+
+    models_dir = os.path.join(output_dir, "models")
+    os.makedirs(models_dir, exist_ok=True)
+    
+    # Initialize agent once (will be trained across epochs)
+    from oskp_rl_up_buffer_experiments import BoxPilingEnv, DQNAgent
+    env = BoxPilingEnv()
+    agent = DQNAgent(
+        state_dims={'height_map': env.pallet_size, 'box_dims': 3},
+        action_size=5,
+        max_height=env.max_height,
+        learning_rate=0.001,
+        min_support_ratio=0.60,
+        require_opposite_edge_support=True,
+    )
+    
+    # Tracking
+    epoch_results = []
+    best_avg_util = 0.0
+    epochs_without_improvement = 0
+    best_model_path = os.path.join(models_dir, "dqn_best_epoch.pt")
+    results_csv = os.path.join(output_dir, "epoch_training_results.csv")
+    
+    env_params = {'max_buffer_size': 0, 'min_support_ratio': 0.60, 'require_opposite_edge_support': True}
+    
+    for epoch in range(1, max_epochs + 1):
+        print(f"\n{'='*50}")
+        print(f"EPOCH {epoch}/{max_epochs}")
+        print(f"{'='*50}")
+        
+        # Shuffle training data each epoch
+        import random
+        random.shuffle(train_subset)
+        
+        # Train for one epoch (one pass through dataset)
+        train_out_dir = os.path.join(output_dir, f"epoch_{epoch}")
+        os.makedirs(train_out_dir, exist_ok=True)
+        
+        # Train using the existing agent (continues learning)
+        metrics = train_one_epoch(agent, train_subset, train_out_dir, env_params)
+        
+        # Validate
+        print(f"\nValidating Epoch {epoch}...")
+        s_cut1 = evaluate(agent, val_cut1, env_params)
+        s_cut2 = evaluate(agent, val_cut2, env_params)
+        s_rs = evaluate(agent, val_rs, env_params)
+        avg_util = (s_cut1 + s_cut2 + s_rs) / 3
+        
+        print(f"  Epoch {epoch} Results:")
+        print(f"    CUT-1: {s_cut1:.2%}, CUT-2: {s_cut2:.2%}, RS: {s_rs:.2%}")
+        print(f"    Average Utilization: {avg_util:.2%}")
+        
+        # Track results
+        epoch_results.append({
+            'epoch': epoch,
+            'cut1': s_cut1,
+            'cut2': s_cut2,
+            'rs': s_rs,
+            'avg_util': avg_util,
+            'epsilon': agent.epsilon
+        })
+        pd.DataFrame(epoch_results).to_csv(results_csv, index=False)
+        
+        # Check for improvement
+        if avg_util > best_avg_util + 0.01:  # 1% improvement threshold
+            best_avg_util = avg_util
+            epochs_without_improvement = 0
+            agent.save_model(best_model_path)
+            print(f"  ★ New best model saved! (Avg Util: {best_avg_util:.2%})")
+        else:
+            epochs_without_improvement += 1
+            print(f"  No improvement for {epochs_without_improvement}/{patience} epochs")
+        
+        # Early stopping
+        if epochs_without_improvement >= patience:
+            print(f"\n{'='*50}")
+            print(f"EARLY STOPPING: No improvement for {patience} epochs")
+            print(f"{'='*50}")
+            break
+    
+    # Final summary
+    print(f"\n{'='*50}")
+    print("TRAINING COMPLETE")
+    print(f"{'='*50}")
+    print(f"Total Epochs: {epoch}")
+    print(f"Best Average Utilization: {best_avg_util:.2%}")
+    print(f"\nEpoch-by-Epoch Progress:")
+    print(pd.DataFrame(epoch_results))
+    
+    return epoch_results
+
+
+def train_one_epoch(agent, episodes_boxes, output_dir, env_params):
+    """Train the agent for one pass through the dataset."""
+    from oskp_rl_up_buffer_experiments import BoxPilingEnv, proxy_scores_for_heuristics
+    from tqdm import tqdm
+    
+    env = BoxPilingEnv()
+    max_buffer_size = env_params.get('max_buffer_size', 2)
+    
+    total_utilization = 0.0
+    heuristic_map = {0: 'stacking', 1: 'best_fit', 2: 'semi_perfect_fit', 3: 'random_fit', 4: 'corner'}
+    
+    pbar = tqdm(range(len(episodes_boxes)), desc="Training", unit="ep")
+    for episode in pbar:
+        state = env.reset()
+        done = False
+        boxes = episodes_boxes[episode]
+        box_idx = 0
+        buffer = []
+        
+        while not done and box_idx < len(boxes):
+            box_dims = boxes[box_idx]
+            box_idx += 1
+            state = env.new_box_arrival(box_dims)
+            
+            pred_mask = agent.predict_mask(state, buffer_count=len(buffer))
+            mask_bias = proxy_scores_for_heuristics(env, pred_mask)
+            h_idx = agent.act_with_mask_bias(state, buffer_count=len(buffer), mask_bias=mask_bias, beta=0.5)
+            heuristic = heuristic_map[h_idx]
+            
+            action, mapping = env.choose_action_by_heuristic(heuristic, pred_mask=pred_mask)
+            if action is None:
+                action, mapping = env.choose_action_by_heuristic(heuristic, pred_mask=None)
+                if action is None:
+                    agent.remember(state, h_idx, -5.0, state, False, len(buffer))
+                    agent.replay()
+                    if len(buffer) < max_buffer_size:
+                        buffer.append(box_dims)
+                    else:
+                        done = True
+                        break
+                    continue
+            
+            next_state, reward, local_done, _ = env.step(action)
+            agent.remember(state, h_idx, reward, next_state, local_done, len(buffer))
+            agent.replay()
+            state = next_state
+            
+            if env._is_terminal():
+                done = True
+                break
+        
+        # Buffer passes
+        while not done and len(buffer) > 0:
+            made_progress = False
+            new_buffer = []
+            for box_dims in buffer:
+                if not env.can_place_box(box_dims):
+                    new_buffer.append(box_dims)
+                    continue
+                state = env.new_box_arrival(box_dims)
+                pred_mask = agent.predict_mask(state, buffer_count=len(buffer))
+                mask_bias = proxy_scores_for_heuristics(env, pred_mask)
+                h_idx = agent.act_with_mask_bias(state, buffer_count=len(buffer), mask_bias=mask_bias, beta=0.5)
+                heuristic = heuristic_map[h_idx]
+                action, _ = env.choose_action_by_heuristic(heuristic, pred_mask=pred_mask)
+                if action is None:
+                    action, _ = env.choose_action_by_heuristic(heuristic, pred_mask=None)
+                if action is not None:
+                    next_state, reward, local_done, _ = env.step(action)
+                    agent.remember(state, h_idx, reward, next_state, local_done, len(buffer))
+                    agent.replay()
+                    state = next_state
+                    made_progress = True
+                else:
+                    if len(new_buffer) < max_buffer_size:
+                        new_buffer.append(box_dims)
+                    else:
+                        done = True
+                        break
+                if env._is_terminal():
+                    done = True
+                    break
+            buffer = new_buffer
+            if not made_progress:
+                done = True
+                break
+        
+        # Metrics
+        utilization = env.current_height_map.sum() / (env.pallet_size[0] * env.pallet_size[1] * env.max_height)
+        total_utilization += utilization
+        
+        # Update epsilon
+        if agent.epsilon > agent.epsilon_min:
+            agent.epsilon *= agent.epsilon_decay
+        
+        # Update target network periodically
+        if episode % 10 == 0:
+            agent.update_target_model()
+        
+        pbar.set_postfix({'Util': f'{utilization:.1%}', 'Eps': f'{agent.epsilon:.3f}'})
+    
+    avg_util = total_utilization / len(episodes_boxes)
+    print(f"\nEpoch Training Summary: Avg Utilization = {avg_util:.2%}")
+    return {'avg_utilization': avg_util}
+
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--exp", type=int, choices=[5, 6, 7, 8, 9], default=9, help="Experiment number")
-    parser.add_argument("--episodes", type=int, default=10000, help="Number of training episodes")
+    parser.add_argument("--exp", type=int, choices=[5, 6, 7, 8, 9, 10], default=10, help="Experiment number")
+    parser.add_argument("--episodes", type=int, default=10000, help="Number of training episodes per epoch")
     parser.add_argument("--val-episodes", type=int, default=None, help="Number of validation episodes")
+    parser.add_argument("--max-epochs", type=int, default=20, help="Maximum number of epochs")
+    parser.add_argument("--patience", type=int, default=3, help="Early stopping patience")
     args = parser.parse_args()
     
     base_output = "experiments_results_refactored"
@@ -714,5 +944,7 @@ if __name__ == "__main__":
         run_final_best_config_experiment(os.path.join(base_output, "exp8_final_best"), args.episodes, args.val_episodes)
     elif args.exp == 9:
         grid_search(os.path.join(base_output, "exp9_grid_search"), args.episodes, args.val_episodes)
+    elif args.exp == 10:
+        run_epoch_training(os.path.join(base_output, "exp10_epoch_training"), args.episodes, args.val_episodes, args.patience, args.max_epochs)
     else:
-        print("Use --exp 5, 6, 7, 8, or 9.")
+        print("Use --exp 5, 6, 7, 8, 9, or 10.")
