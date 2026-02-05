@@ -253,107 +253,219 @@ class BoxPilingEnv:
         acts, _ = self.get_valid_actions(box_dims)
         return len(acts) > 0
 
-    # ----- Heuristics (unchanged) -----
+    # =========================================================
+    # Corrected Heuristics (Paper-Aligned + Refined Corner)
+    # =========================================================
+
+    def _get_contact_score(self, xx, yy, w, d, z):
+        """
+        Helper: Calculates how well the box 'fits' horizontally by checking 
+        contact with neighbors or walls. 
+        """
+        L, W = self.pallet_size
+        perimeter_contact = 0
+        
+        # Check West Wall or Neighbor
+        if xx == 0: 
+            perimeter_contact += d # Wall contact
+        else:
+            # Check if neighbor height is >= current z (meaning we are touching it)
+            neighbor_h = self.current_height_map[xx-1, yy:yy+d]
+            perimeter_contact += np.sum(neighbor_h >= z)
+
+        # Check East Wall or Neighbor
+        if xx + w == L: 
+            perimeter_contact += d
+        else:
+            neighbor_h = self.current_height_map[xx+w, yy:yy+d]
+            perimeter_contact += np.sum(neighbor_h >= z)
+
+        # Check North Wall or Neighbor
+        if yy == 0: 
+            perimeter_contact += w
+        else:
+            neighbor_h = self.current_height_map[xx:xx+w, yy-1]
+            perimeter_contact += np.sum(neighbor_h >= z)
+
+        # Check South Wall or Neighbor
+        if yy + d == W: 
+            perimeter_contact += w
+        else:
+            neighbor_h = self.current_height_map[xx:xx+w, yy+d]
+            perimeter_contact += np.sum(neighbor_h >= z)
+            
+        return perimeter_contact
+
     def heuristic_stacking(self, valid_actions):
-        best_action, best_support = None, -np.inf
-        for action in valid_actions:
-            rotation = action % 2
-            remaining = action // 2
-            yy = remaining % self.pallet_size[1]
-            xx = remaining // self.pallet_size[1]
-            w, d, h = self.get_rotated_box_dims(self.current_box, rotation)
-            valid, z = self._is_valid_placement(xx, yy, w, d, h)
-            if valid:
-                support_level = z # minimize z? or maximize support? Stacking usually prioritizes Higher Z (densely).
-                # But here Stacking might mean "On top of others".
-                # Let's say Stacking = Max Z.
-                if support_level > best_support:
-                    best_support, best_action = support_level, action
-        return best_action
+        """
+        [cite_start]Paper: "Prioritizes vertical space utilization by packing items in columns"[cite: 227].
+        Logic: Find the LOWEST Z. If Z is equal, prefer the spot that maintains the 'column'
+        (highest support ratio), strictly penalizing overhangs to prevent towers from falling.
+        """
+        best_action, best_score = None, np.inf # Lower score is better
 
-    def heuristic_best_fit(self, valid_actions):
-        best_action, best_gap = None, np.inf
         for action in valid_actions:
             rotation = action % 2
             remaining = action // 2
             yy = remaining % self.pallet_size[1]
             xx = remaining // self.pallet_size[1]
             w, d, h = self.get_rotated_box_dims(self.current_box, rotation)
+            
             valid, z = self._is_valid_placement(xx, yy, w, d, h)
             if valid:
-                gap = self.max_height - (z + h)
-                if gap < best_gap:
-                    best_gap, best_action = gap, action
-        return best_action
-
-    def heuristic_semi_perfect_fit(self, valid_actions):
-        best_action, best_score = None, np.inf
-        for action in valid_actions:
-            rotation = action % 2
-            remaining = action // 2
-            yy = remaining % self.pallet_size[1]
-            xx = remaining // self.pallet_size[1]
-            w, d, h = self.get_rotated_box_dims(self.current_box, rotation)
-            valid, z = self._is_valid_placement(xx, yy, w, d, h)
-            if valid:
-                # Calculate support in the layer below using height map
+                # Calculate support ratio (area supported / box area)
                 region = self.current_height_map[xx:xx+w, yy:yy+d]
-                # support_count is the number of cells that are exactly at base_z
-                support_count = np.sum(region == z)
+                support_area = np.sum(region == z)
+                support_ratio = support_area / (w * d)
+
+                # Score:
+                # 1. Primary: Minimize Z (Build from bottom up)
+                # 2. Secondary: Maximize Support (Paper implies stable columns)
+                # We subtract support_ratio so "1.0 support" reduces the score (improves it).
+                score = z - (support_ratio * 0.1) 
                 
-                waste = (w * d - support_count)
-                gap = self.max_height - (z + h)
-                score = waste + gap
                 if score < best_score:
                     best_score, best_action = score, action
         return best_action
 
-    def heuristic_random_fit(self, valid_actions):
-        placed_volume = sum(b[2] * b[3] * b[4] for b in self.placed_boxes)
-        pallet_volume = self.pallet_size[0] * self.pallet_size[1] * self.max_height
-        utilization = placed_volume / pallet_volume if pallet_volume > 0 else 0
-        threshold = 0.10
-        p_stack = 0.66 if utilization < threshold else 0.33
-        return (self.heuristic_stacking(valid_actions)
-                if np.random.rand() < p_stack
-                else self.heuristic_semi_perfect_fit(valid_actions))
+    def heuristic_best_fit(self, valid_actions):
+        """
+        [cite_start]Paper: "Seeks to fill spaces by selecting the smallest maximal space available"[cite: 252].
+        Logic: Minimize the 'gap' between the box and its surroundings.
+        In a Height Map, this means maximizing the contact perimeter (touching neighbors).
+        """
+        best_action, best_score = None, -np.inf # Higher score is better
 
-    def heuristic_corner(self, valid_actions):
-        best_action, best_score = None, -np.inf
-        L, W = self.pallet_size
-        
         for action in valid_actions:
             rotation = action % 2
             remaining = action // 2
             yy = remaining % self.pallet_size[1]
             xx = remaining // self.pallet_size[1]
             w, d, h = self.get_rotated_box_dims(self.current_box, rotation)
-            valid, base_z = self._is_valid_placement(xx, yy, w, d, h)
             
-            if not valid:
-                continue
+            valid, z = self._is_valid_placement(xx, yy, w, d, h)
+            if valid:
+                # 1. Contact Score: Proxy for "Smallest Maximal Space". 
+                # High contact = Small gap between box and neighbors.
+                contact = self._get_contact_score(xx, yy, w, d, z)
                 
-            sides_touching = 0
-            # West
-            if xx == 0: sides_touching += 1
-            elif np.any(self.current_height_map[xx-1, yy:yy+d] >= base_z): sides_touching += 1
-            
-            # East
-            if xx + w == L: sides_touching += 1
-            elif np.any(self.current_height_map[xx+w, yy:yy+d] >= base_z): sides_touching += 1
-            
-            # North
-            if yy == 0: sides_touching += 1
-            elif np.any(self.current_height_map[xx:xx+w, yy-1] >= base_z): sides_touching += 1
-            
-            # South
-            if yy + d == W: sides_touching += 1
-            elif np.any(self.current_height_map[xx:xx+w, yy+d] >= base_z): sides_touching += 1
-            
-            score = sides_touching * 100 - base_z
-            if score > best_score:
-                best_score, best_action = score, action
+                # 2. Tie-breaker: Place as low as possible (Gravity)
+                # We subtract Z * 0.01 so that among equal contact scores, lower Z wins.
+                score = contact - (z * 0.01)
                 
+                if score > best_score:
+                    best_score, best_action = score, action
+        return best_action
+
+    def heuristic_semi_perfect_fit(self, valid_actions):
+        """
+        Paper: "Minimizes wasted space... scenarios where the box perfectly fits in 
+        [cite_start]three, two, or one dimension(s)"[cite: 258, 259].
+        Logic: Check for exact dimension matches (filling a hole X or Y).
+        """
+        best_action, best_score = None, -np.inf # Higher score is better
+
+        for action in valid_actions:
+            rotation = action % 2
+            remaining = action // 2
+            yy = remaining % self.pallet_size[1]
+            xx = remaining // self.pallet_size[1]
+            w, d, h = self.get_rotated_box_dims(self.current_box, rotation)
+            
+            valid, z = self._is_valid_placement(xx, yy, w, d, h)
+            if valid:
+                # Dimension Matches
+                # Check X-axis match (touching both West and East?)
+                west_touch = (xx == 0) or np.any(self.current_height_map[xx-1, yy:yy+d] >= z)
+                east_touch = (xx + w == self.pallet_size[0]) or np.any(self.current_height_map[xx+w, yy:yy+d] >= z)
+                x_match = 1 if (west_touch and east_touch) else 0
+
+                # Check Y-axis match (touching both North and South?)
+                north_touch = (yy == 0) or np.any(self.current_height_map[xx:xx+w, yy-1] >= z)
+                south_touch = (yy + d == self.pallet_size[1]) or np.any(self.current_height_map[xx:xx+w, yy+d] >= z)
+                y_match = 1 if (north_touch and south_touch) else 0
+                
+                # Check Z-axis match / Waste
+                # Waste = Empty space BELOW the box (lack of support).
+                # The paper assumes perfect fit minimizes wasted space.
+                region = self.current_height_map[xx:xx+w, yy:yy+d]
+                support_area = np.sum(region == z)
+                waste = (w * d) - support_area
+                waste_penalty = waste * 10  # Heavily penalize holes below
+                
+                # Score: Perfect 2D fit > 1D fit > 0D fit.
+                score = (x_match * 100) + (y_match * 100) - waste_penalty - z
+                
+                if score > best_score:
+                    best_score, best_action = score, action
+        return best_action
+
+    def heuristic_random_fit(self, valid_actions):
+        """
+        [cite_start]Paper: "Initially 66.67% stacking... by end, semi-perfect fit rises to 66.67%"[cite: 311, 313].
+        [cite_start]"The best shifting point for Cut-1 and RS is 10%"[cite: 318, 319].
+        """
+        if not valid_actions:
+            return None
+
+        # Calculate Utilization
+        pallet_vol = self.pallet_size[0] * self.pallet_size[1] * self.max_height
+        placed_vol = sum(b[2]*b[3]*b[4] for b in self.placed_boxes)
+        utilization = placed_vol / pallet_vol if pallet_vol > 0 else 0
+        
+        # Paper threshold logic
+        threshold = 0.10 
+        
+        if utilization < threshold:
+            # Early game: 66% Stacking, 33% Semi-Perfect
+            p_stack = 0.66
+        else:
+            # Late game: 33% Stacking, 66% Semi-Perfect
+            p_stack = 0.33
+            
+        if np.random.rand() < p_stack:
+            return self.heuristic_stacking(valid_actions)
+        else:
+            return self.heuristic_semi_perfect_fit(valid_actions)
+
+    def heuristic_corner(self, valid_actions):
+        """
+        Logic: Pack from Outside -> In.
+        Prioritizes:
+        1. Touching 2+ Walls/Boundaries (True Corners)
+        2. Touching 1 Wall/Boundary
+        3. Low Z (Gravity)
+        """
+        best_action, best_score = None, -np.inf # Higher score is better
+        L, W = self.pallet_size
+
+        for action in valid_actions:
+            rotation = action % 2
+            remaining = action // 2
+            yy = remaining % self.pallet_size[1]
+            xx = remaining // self.pallet_size[1]
+            w, d, h = self.get_rotated_box_dims(self.current_box, rotation)
+            
+            valid, z = self._is_valid_placement(xx, yy, w, d, h)
+            if valid:
+                # Count Walls Touched (Outside-In Strategy)
+                walls_hit = 0
+                if xx == 0: walls_hit += 1
+                if xx + w == L: walls_hit += 1
+                if yy == 0: walls_hit += 1
+                if yy + d == W: walls_hit += 1
+                
+                # Count Neighbor Contact (Tying it together)
+                contact = self._get_contact_score(xx, yy, w, d, z)
+                
+                # Score Calculation:
+                # Priority 1: Walls (1000 points per wall) -> Forces outside placement
+                # Priority 2: Contact (10 points per unit) -> Forces tight packing
+                # Priority 3: Minimize Z (negative z) -> Gravity
+                score = (walls_hit * 1000) + (contact * 10) - z
+                
+                if score > best_score:
+                    best_score, best_action = score, action
         return best_action
 
     def choose_action_by_heuristic(self, heuristic_name, pred_mask=None):
@@ -390,7 +502,7 @@ class BoxPilingEnv:
         valid, base_z = self._is_valid_placement(xx, yy, w, d, h)
         if not valid:
             self.invalid_actions_attempted += 1
-            reward = -2000
+            reward = -5
             return self._get_state(), reward, False, {"invalid": True}
 
         self._update_height_map(xx, yy, w, d, h, base_z)
@@ -400,7 +512,7 @@ class BoxPilingEnv:
         # (Box Volume / Pallet Volume) * Scale
         pallet_vol = self.pallet_size[0] * self.pallet_size[1] * self.max_height
         box_vol = w * d * h
-        reward = (box_vol / pallet_vol) * 1000 # Scaling factor
+        reward = (box_vol / pallet_vol) * 10 # Scaling factor
         
         self.current_box = None
         done = False # controlled by stream
@@ -443,82 +555,130 @@ class DQNAgent:
         state_dims,
         action_size=5,
         max_height=10,
-        # same bridging params for GT mask
-        min_support_ratio=0.50,
-        require_opposite_edge_support=True,
-        # min_support_ratio=0.50, # Removed bridging parameters
-        # require_opposite_edge_support=True, # Removed bridging parameters
-        # max_gap=2, # Removed bridging parameters
         learning_rate=0.001,
+        # Unused params kept for compatibility if needed
+        min_support_ratio=0.60,
+        require_opposite_edge_support=True,
     ):
         self.state_dims = state_dims
         self.action_size = action_size
         self.max_height = max_height
         self.learning_rate = learning_rate
 
-        # store GT policy for mask supervision
-        self.model = self._build_model()
-        self.target_model = self._build_model()
-
-        self.optimizer = optim.RMSprop(self.model.parameters(), lr=self.learning_rate)
-        # Using constant learning rate (no scheduler) to prevent decay and preserve LR experiment integrity
-
-        self.memory = []
-        self.batch_size = 32
-        self.gamma = 0.95
-        self.epsilon = 1.0
-        self.epsilon_min = 0.05
-        self.epsilon_decay = 0.995
-
-        self.mask_loss_weight = 0.15
-        self.optimizer_step_count = 0
-        
-        # Device selection
         self.device = torch.device("mps" if torch.backends.mps.is_available() else "cuda" if torch.cuda.is_available() else "cpu")
         print(f"Using device: {self.device}")
+
+        self.model = self._build_model().to(self.device)
+        self.target_model = self._build_model().to(self.device)
         
-        self.model = self.model.to(self.device)
-        self.target_model = self.target_model.to(self.device)
+        self.optimizer = optim.RMSprop(self.model.parameters(), lr=self.learning_rate)
+
+        # FIX 1: Large Memory for Epoch Training
+        self.memory = []
+        self.memory_size = 50000 
+        self.batch_size = 32
+        self.gamma = 0.95
+        
+        # Epsilon managed externally in training loop, but defaults here
+        self.epsilon = 1.0 
+        self.epsilon_min = 0.05
+        
+        self.mask_loss_weight = 0.15
+        self.optimizer_step_count = 0
+
+    # ------------------------------------------------------------------
+    # FIX 2: SPATIAL STACKING (The "Pro" Input Method)
+    # ------------------------------------------------------------------
+    def _norm(self, state, buffer_count=0):
+        L, W = self.state_dims['height_map']
+        
+        # 1. Height Map (Channel 0)
+        # Normalize to [0, 1]
+        hm = state['height_map'] / float(self.max_height)
+        
+        # 2. Box Dimensions Stretched (Channels 1, 2, 3)
+        # We "stretch" the 3 scalars to cover the whole 10x10 grid.
+        # This allows the Conv layers to do pixel-wise comparisons.
+        box_dims = state['box_dims']
+        box_tensor = np.zeros((3, L, W), dtype=np.float32)
+        
+        if np.sum(box_dims) > 0:
+            box_tensor[0, :, :] = box_dims[0] / L           # Normalized Length
+            box_tensor[1, :, :] = box_dims[1] / W           # Normalized Width
+            box_tensor[2, :, :] = box_dims[2] / self.max_height # Normalized Height
+        
+        # 3. Stack -> Shape (1, 4, 10, 10)
+        # Channel 0: Height Map
+        # Channel 1: Box Length (every pixel is l_norm)
+        # Channel 2: Box Width (every pixel is w_norm)
+        # Channel 3: Box Height (every pixel is h_norm)
+        combined_state = np.concatenate([hm[np.newaxis, :, :], box_tensor], axis=0)
+        
+        # 4. Buffer feature (Scalar)
+        buf = np.array([min(buffer_count, 10) / 10.0], dtype=np.float32)
+        
+        return (torch.FloatTensor(combined_state).unsqueeze(0).to(self.device),
+                None, # Box dims are now inside the conv input!
+                torch.FloatTensor(buf).unsqueeze(0).to(self.device))
 
     def _build_model(self):
-        class Net(nn.Module):
+        class ProNet(nn.Module):
             def __init__(self, pallet_size, action_size):
                 super().__init__()
                 L, W = pallet_size
                 self.L, self.W = L, W
+                
+                # FIX 3: 4 Input Channels, Stride=1 (No compression)
                 self.conv = nn.Sequential(
-                    nn.Conv2d(1, 16, 3, 1, 1), nn.ReLU(),
-                    nn.Conv2d(16, 32, 3, 2, 1), nn.ReLU(),
-                    nn.Conv2d(32, 64, 3, 2, 1), nn.ReLU(),
+                    nn.Conv2d(4, 64, 3, padding=1), nn.ReLU(),
+                    nn.Conv2d(64, 64, 3, padding=1), nn.ReLU(),
+                    nn.Conv2d(64, 64, 3, padding=1), nn.ReLU(),
                     nn.Flatten()
                 )
-                with torch.no_grad():
-                    conv_out = self.conv(torch.zeros(1, 1, L, W)).shape[1]
-                self.val = nn.Sequential(nn.Linear(conv_out + 4, 128), nn.ReLU(), nn.Linear(128, 1))
-                self.adv = nn.Sequential(nn.Linear(conv_out + 4, 128), nn.ReLU(), nn.Linear(128, action_size))
-                self.mask_head = nn.Sequential(nn.Linear(conv_out + 4, 256), nn.ReLU(),
-                                               nn.Linear(256, 2 * L * W))
+                
+                # Output is 64 * 10 * 10 = 6400 features
+                conv_out_size = 64 * L * W 
+                
+                # Critic Head (Value)
+                self.val = nn.Sequential(
+                    nn.Linear(conv_out_size + 1, 512), nn.ReLU(), 
+                    nn.Linear(512, 1)
+                )
+                
+                # Actor Head (Advantage)
+                self.adv = nn.Sequential(
+                    nn.Linear(conv_out_size + 1, 512), nn.ReLU(), 
+                    nn.Linear(512, action_size)
+                )
+                
+                # Mask Head (Auxiliary)
+                self.mask_head = nn.Sequential(
+                    nn.Linear(conv_out_size + 1, 512), nn.ReLU(),
+                    nn.Linear(512, 2 * L * W)
+                )
 
-            def forward(self, hm, bd, buf):
-                f = self.conv(hm)
-                # Concatenate height map features, box dims, and buffer feature
-                z = torch.cat([f, bd, buf], dim=1)
+            def forward(self, combined_state, _, buf):
+                f = self.conv(combined_state)
+                # Inject buffer status into dense layers
+                z = torch.cat([f, buf], dim=1)
+                
                 v = self.val(z)
                 a = self.adv(z)
                 q = v + (a - a.mean(dim=1, keepdim=True))
                 mask_logits = self.mask_head(z).view(-1, 2, self.L, self.W)
                 return q, mask_logits
 
-        return Net(self.state_dims['height_map'], self.action_size)
+        return ProNet(self.state_dims['height_map'], self.action_size)
 
-    # memory: Compute GT mask ONCE and store it
+    # --- Standard Methods (Updated for new input shape) ---
+
     def remember(self, s, a, r, ns, d, buffer_count):
+        # We re-compute mask here or passed in. 
+        # Assuming your old code logic for mask computation is available.
         L, W = self.state_dims['height_map']
-        # Compute GT mask explicitly here
         hm_raw = s['height_map']
         bd_raw = s['box_dims']
         
-        # Only compute if we have a box
         if np.sum(bd_raw) > 0:
             gt_mask = compute_gt_mask(hm_raw, bd_raw, pallet_size=(L, W), max_height=self.max_height)
             gt_mask = gt_mask.astype(np.float32)
@@ -526,94 +686,107 @@ class DQNAgent:
             gt_mask = np.zeros((2, L, W), dtype=np.float32)
             
         self.memory.append((s, a, r, ns, d, buffer_count, gt_mask))
-        if len(self.memory) > 10000:
+        if len(self.memory) > self.memory_size:
             self.memory.pop(0)
 
-    # normalization
-    def _norm(self, state, buffer_count=0):
-        L, W = self.state_dims['height_map']
-        hm = state['height_map'] / float(self.max_height)
-        bd = state['box_dims'] / np.array([L, W, self.max_height], dtype=np.float32)
-        # Normalized buffer vision (capped at 10 for consistency)
-        buf = np.array([min(buffer_count, 10) / 10.0], dtype=np.float32)
-        return (torch.FloatTensor(hm).unsqueeze(0).unsqueeze(0).to(self.device),
-                torch.FloatTensor(bd).unsqueeze(0).to(self.device),
-                torch.FloatTensor(buf).unsqueeze(0).to(self.device))
-
-    # action selection (soft bias is computed outside and passed in)
     @torch.no_grad()
     def act_with_mask_bias(self, state, buffer_count=0, mask_bias=None, beta=0.5, eps=1e-6):
         if np.random.rand() <= self.epsilon:
             return int(np.random.randint(0, self.action_size))
-        hm, bd, buf = self._norm(state, buffer_count)
-        q, _ = self.model(hm, bd, buf)
+        
+        combined, _, buf = self._norm(state, buffer_count)
+        q, _ = self.model(combined, None, buf) # Pass None for box_dims
         q = q.squeeze(0)
+        
         if mask_bias is not None:
             b = torch.tensor(mask_bias, dtype=torch.float32).to(self.device)
-            b = (b - b.mean()) / (b.std() + eps)
+            # Normalize bias locally
+            if b.std() > 1e-6:
+                b = (b - b.mean()) / (b.std())
             q = q + beta * b
+            
         return int(torch.argmax(q).item())
 
     @torch.no_grad()
     def predict_mask(self, state, buffer_count=0, threshold=0.5):
-        hm, bd, buf = self._norm(state, buffer_count)
-        _, ml = self.model(hm, bd, buf)
+        combined, _, buf = self._norm(state, buffer_count)
+        _, ml = self.model(combined, None, buf)
         return (torch.sigmoid(ml)[0].cpu().numpy() > threshold)
+    
+    @torch.no_grad()
+    def get_mask_confidence(self, state, buffer_count=0):
+        """
+        Returns the raw continuous scores (0.0 to 1.0) from the mask head.
+        Used for the 'Maximal Space Passthrough' investigation.
+        """
+        combined, _, buf = self._norm(state, buffer_count)
+        # Pass None for box_dims as they are embedded in 'combined' for ProNet
+        _, ml = self.model(combined, None, buf)
+        return torch.sigmoid(ml)[0].cpu().numpy()
 
-    # training
     def replay(self):
         if len(self.memory) < self.batch_size:
             return
+        
         batch = random.sample(self.memory, self.batch_size)
-        # Unpack with gt_mask
         states, actions, rewards, next_states, dones, buffer_counts, gt_masks_list = zip(*batch)
 
         L, W = self.state_dims['height_map']
-        hm_s_raw = np.array([s['height_map'] for s in states], np.float32)
-        bd_s_raw = np.array([s['box_dims'] for s in states], np.float32)
-        hm_n_raw = np.array([s['height_map'] for s in next_states], np.float32)
-        bd_n_raw = np.array([s['box_dims'] for s in next_states], np.float32)
-        bc_raw = np.array(buffer_counts, np.float32)
         
-        # Pre-computed masks
+        # Helper to batch process the "Spatial Stacking"
+        def process_batch_states(s_list):
+            processed = []
+            for s in s_list:
+                hm = s['height_map'] / float(self.max_height)
+                bd = s['box_dims']
+                bt = np.zeros((3, L, W), dtype=np.float32)
+                if np.sum(bd) > 0:
+                    bt[0] = bd[0]/L
+                    bt[1] = bd[1]/W
+                    bt[2] = bd[2]/self.max_height
+                combined = np.concatenate([hm[np.newaxis, :, :], bt], axis=0)
+                processed.append(combined)
+            return np.array(processed, dtype=np.float32)
+
+        s_batch = torch.FloatTensor(process_batch_states(states)).to(self.device)
+        ns_batch = torch.FloatTensor(process_batch_states(next_states)).to(self.device)
+        
+        bc_batch = torch.FloatTensor(np.array(buffer_counts)).unsqueeze(1).to(self.device)
+        bc_batch = torch.clamp(bc_batch, 0, 10) / 10.0
+        
         gt_masks = torch.from_numpy(np.array(gt_masks_list, dtype=np.float32)).to(self.device)
         
-        hm_s = torch.FloatTensor(hm_s_raw / float(self.max_height)).unsqueeze(1).to(self.device)
-        bd_s = torch.FloatTensor(bd_s_raw / np.array([L, W, self.max_height], np.float32)).to(self.device)
-        bc_s = torch.FloatTensor(np.minimum(bc_raw, 10.0) / 10.0).unsqueeze(1).to(self.device)
-        
-        hm_n = torch.FloatTensor(hm_n_raw / float(self.max_height)).unsqueeze(1).to(self.device)
-        bd_n = torch.FloatTensor(bd_n_raw / np.array([L, W, self.max_height], np.float32)).to(self.device)
-        bc_n = bc_s 
-
-        q_cur, mask_logits = self.model(hm_s, bd_s, bc_s)
+        # Forward pass (Note: None for box_dims arg)
+        q_cur, mask_logits = self.model(s_batch, None, bc_batch)
         q_cur = q_cur.gather(1, torch.LongTensor(actions).to(self.device).unsqueeze(1)).squeeze(1)
-        with torch.no_grad():
-            q_next, _ = self.target_model(hm_n, bd_n, bc_n)
-            q_next, _ = q_next.max(1)
         
+        with torch.no_grad():
+            q_next, _ = self.target_model(ns_batch, None, bc_batch)
+            q_next, _ = q_next.max(1)
+            
         dones_t = torch.FloatTensor([1.0 if d else 0.0 for d in dones]).to(self.device)
         rewards_t = torch.FloatTensor(rewards).to(self.device)
-        
         tgt = rewards_t + self.gamma * q_next * (1 - dones_t)
-        q_loss = nn.MSELoss()(q_cur, tgt)
-
-        # Skip samples without a box
-        has_box = torch.from_numpy((bd_s_raw.sum(axis=1) > 0).astype(np.float32)).to(self.device)
-
-        # Use MSE loss for continuous mask targets (flatness scores)
+        
+        q_loss = nn.SmoothL1Loss()(q_cur, tgt)
+        
+        # Mask Loss (Only for valid boxes)
+        # Check channel 1 (Box Length) > 0
+        has_box = (s_batch[:, 1, 0, 0] > 0).float()
+        
         mask_preds = torch.sigmoid(mask_logits)
-        per_elem = (mask_preds - gt_masks) ** 2
-        per_sample = per_elem.mean(dim=(1, 2, 3))
-        mask_loss = (per_sample * has_box).sum() / (has_box.sum() + 1e-6)
-
+        # Mean over pixels (dim 1,2,3 -> channels, h, w)
+        per_sample_loss = ((mask_preds - gt_masks) ** 2).mean(dim=(1,2,3))
+        mask_loss = (per_sample_loss * has_box).sum() / (has_box.sum() + 1e-6)
+        
         loss = q_loss + self.mask_loss_weight * mask_loss
+        
         self.optimizer.zero_grad()
         loss.backward()
+        torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
         self.optimizer.step()
-        self.optimizer_step_count += 1
-        
-        # Track losses for monitoring
+        self.optimizer_step_count += 1 # Important for target update
+
         self.last_q_loss = q_loss.item()
         self.last_mask_loss = mask_loss.item()
 
@@ -633,86 +806,110 @@ class DQNAgent:
         self.model.load_state_dict(checkpoint['model_state_dict'])
         self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
         self.epsilon = checkpoint['epsilon']
-        # self.memory = checkpoint['memory'] # Optional: might not want to load old memory
         self.target_model.load_state_dict(self.model.state_dict())
 
 
 
-def proxy_scores_for_heuristics(env_obj, pred_mask):
-    # Initialize with default values
-    best_stacking = -1e9
-    best_best_fit = -1e9
-    best_semi_perfect = -1e9
-    best_corner = -1e9
+def proxy_scores_for_heuristics(env_obj, pred_mask_probs):
+    """
+    Directly maps the Heuristic's chosen position to the Mask's predicted score.
+    Since the Mask is trained on 'Maximal Spaces', this score IS the Maximal Space quality.
+    """
+    # Index: 0=Stacking, 1=BestFit, 2=SemiPerfect, 3=Random, 4=Corner
+    scores = [0.0] * 5 
     
     box = env_obj.current_box
-    if box is None:
-        return [0.0, 0.0, 0.0, 0.0, 0.0]
+    if box is None: return scores
 
     Lp, Wp = env_obj.pallet_size
     max_h = env_obj.max_height
-    hm = env_obj.current_height_map  # Cache reference
-    
-    # Pre-calculated dimensions for both rotations
+    hm = env_obj.current_height_map
     rot_dims = [env_obj.get_rotated_box_dims(box, 0), env_obj.get_rotated_box_dims(box, 1)]
 
+    # We want to find the specific (x,y) that each heuristic would choose,
+    # then grab the mask_probability at that exact coordinate.
+    
+    # Init with (Metric, MaskScore)
+    # Stacking Metric: -Z
+    best_stack = (-float('inf'), 0.0)
+    # BestFit Metric: -Gap
+    best_bf = (-float('inf'), 0.0)
+    # SemiPerfect Metric: -Waste
+    best_semi = (-float('inf'), 0.0)
+    # Corner Metric: Walls
+    best_corn = (-float('inf'), 0.0)
+
+    found_valid = False
+
     for rot in [0, 1]:
-        cand_mask = pred_mask[rot]
-        # Optimization: check if any candidates exist before finding indices
-        if not np.any(cand_mask):
-            continue
-
-        w, d, h = rot_dims[rot]
-        cand = np.argwhere(cand_mask)
+        # Optimization: Only look at spots the network thinks are plausible (>1%)
+        mask_probs = pred_mask_probs[rot]
+        valid_indices = np.argwhere(mask_probs > 0.01)
         
-        # Simple bounds filter in numpy (faster than loop check)
-        valid_mask = (cand[:, 0] <= Lp - w) & (cand[:, 1] <= Wp - d)
-        valid_cand = cand[valid_mask]
-
-        if len(valid_cand) == 0:
-            continue
-
-        for i in range(len(valid_cand)):
-            xx, yy = valid_cand[i]
+        w, d, h = rot_dims[rot]
+        
+        valid_mask = (valid_indices[:, 0] <= Lp - w) & (valid_indices[:, 1] <= Wp - d)
+        candidates = valid_indices[valid_mask]
+        
+        if len(candidates) > 0: found_valid = True
+        
+        for i in range(len(candidates)):
+            xx, yy = candidates[i]
             
-            # Slicing is the heavy part, but unavoidable without advanced tricks
+            # THE CORE: This value represents "Maximal Space Quality" (from your GT definition)
+            maximal_space_score = mask_probs[xx, yy]
+            
+            # --- Re-run Heuristic Logic to identify the chosen spot ---
             region = hm[xx:xx + w, yy:yy + d]
+            support_z = np.max(region)
+            gap = max_h - (support_z + h)
             
-            # Fast compute
-            support = np.max(region)
-            
-            # Heuristic Logic
-            gap = max_h - (support + h)
-            
-            # Stacking
-            if support > best_stacking:
-                best_stacking = support
-            
-            # Best Fit
-            if -gap > best_best_fit:
-                best_best_fit = -gap
+            # 1. Stacking (Maximize -Z)
+            m_stack = -support_z
+            if m_stack > best_stack[0]:
+                best_stack = (m_stack, maximal_space_score)
+            elif m_stack == best_stack[0]:
+                # Tie-breaker: If heights are equal, prefer the better Maximal Space
+                best_stack = (m_stack, max(best_stack[1], maximal_space_score))
 
-            # Semi-Perfect
-            support_count = np.count_nonzero(region == support)
+            # 2. Best Fit (Maximize -Gap)
+            m_bf = -gap
+            if m_bf > best_bf[0]:
+                best_bf = (m_bf, maximal_space_score)
+            elif m_bf == best_bf[0]:
+                best_bf = (m_bf, max(best_bf[1], maximal_space_score))
+
+            # 3. Semi-Perfect (Maximize -Waste)
+            support_count = np.sum(region == support_z)
             waste = (w * d) - support_count
-            
-            semi_score = -(waste + gap)
-            if semi_score > best_semi_perfect:
-                best_semi_perfect = semi_score
+            m_semi = -(waste + gap)
+            if m_semi > best_semi[0]:
+                best_semi = (m_semi, maximal_space_score)
+            elif m_semi == best_semi[0]:
+                best_semi = (m_semi, max(best_semi[1], maximal_space_score))
 
-            # Corner
-            sides = 0
-            if xx == 0 or np.any(hm[xx-1, yy:yy+d] >= support): sides += 1
-            if xx+w == Lp or np.any(hm[xx+w, yy:yy+d] >= support): sides += 1
-            if yy == 0 or np.any(hm[xx:xx+w, yy-1] >= support): sides += 1
-            if yy+d == Wp or np.any(hm[xx:xx+w, yy+d] >= support): sides += 1
-            
-            c_score = sides * 100 - support
-            if c_score > best_corner:
-                best_corner = c_score
+            # 4. Corner (Maximize Walls)
+            walls = 0
+            if xx == 0: walls += 1
+            if xx+w == Lp: walls += 1
+            if yy == 0: walls += 1
+            if yy+d == Wp: walls += 1
+            m_corn = walls
+            if m_corn > best_corn[0]:
+                best_corn = (m_corn, maximal_space_score)
+            elif m_corn == best_corn[0]:
+                best_corn = (m_corn, max(best_corn[1], maximal_space_score))
 
-    return [best_stacking, best_best_fit, best_semi_perfect, 0.0, best_corner]
+    if not found_valid: return scores
 
+    # Return the Maximal Space Score associated with each heuristic's choice
+    scores[0] = best_stack[1]
+    scores[1] = best_bf[1]
+    scores[2] = best_semi[1]
+    scores[3] = 0.5 
+    scores[4] = best_corn[1]
+    
+    return scores
 # ===========================================
 # Training loop (Option-A soft-bias unchanged)
 # ===========================================
