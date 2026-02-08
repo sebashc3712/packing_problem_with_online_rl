@@ -23,7 +23,7 @@ def evaluate(agent, episodes_boxes, env_params):
     env = BoxPilingEnv(**env_args)
     
     total_utilization = 0.0
-    heuristic_map = {0: 'stacking', 1: 'best_fit', 2: 'semi_perfect_fit', 3: 'random_fit', 4: 'corner'}
+    heuristic_map = {0: 'stacking', 1: 'best_fit', 2: 'semi_perfect_fit', 3: 'corner'}
     heuristic_counts = {k: 0 for k in heuristic_map.values()}
     total_decisions = 0
     total_invalid_learned = 0
@@ -49,9 +49,13 @@ def evaluate(agent, episodes_boxes, env_params):
             pred_mask = agent.predict_mask(state, buffer_count=len(buffer))
             
             # Use the proxy scores function from the module!
-            mask_bias = proxy_scores_for_heuristics(env, pred_mask)
+            # Refactored to pass state explicitly
+            mask_bias = proxy_scores_for_heuristics(
+                env.current_height_map, env.current_box, 
+                env.pallet_size, env.max_height, pred_mask
+            )
             
-            h_idx = agent.act_with_mask_bias(state, buffer_count=len(buffer), mask_bias=mask_bias, beta=0.5) 
+            h_idx = agent.get_action_with_prior(state, mask_bias, buffer_count=len(buffer)) 
             heuristic = heuristic_map[h_idx]
             heuristic_counts[heuristic] += 1
             total_decisions += 1
@@ -91,8 +95,11 @@ def evaluate(agent, episodes_boxes, env_params):
                     
                 state = env.new_box_arrival(box_dims)
                 pred_mask = agent.predict_mask(state, buffer_count=len(buffer))
-                mask_bias = proxy_scores_for_heuristics(env, pred_mask)
-                h_idx = agent.act_with_mask_bias(state, buffer_count=len(buffer), mask_bias=mask_bias, beta=0.5)
+                mask_bias = proxy_scores_for_heuristics(
+                    env.current_height_map, env.current_box, 
+                    env.pallet_size, env.max_height, pred_mask
+                )
+                h_idx = agent.get_action_with_prior(state, mask_bias, buffer_count=len(buffer))
                 heuristic = heuristic_map[h_idx]
                 heuristic_counts[heuristic] += 1
                 total_decisions += 1
@@ -185,7 +192,7 @@ def run_experiment_1(output_dir, train_episodes=10000, val_episodes=None):
         output_dir=train_out_dir,
         return_agent=True,
         # Default params
-        learning_rate=0.001,
+        learning_rate=0.0001,
         max_buffer_size=float('inf')
     )
     
@@ -719,12 +726,12 @@ def grid_search(output_dir, train_episodes=10000, val_episodes=None):
     print(pd.DataFrame(results))
     
 
-def run_epoch_training(output_dir, train_episodes=10000, val_episodes=None, patience=3, max_epochs=20, buffer_size=0):
-    print(f"\n=== Experiment 10: Epoch-Based Training (Buffer={buffer_size}, LR=0.001) ===")
+def run_epoch_training(output_dir, train_episodes=10000, val_episodes=None, patience=12, max_epochs=20, buffer_size=0):
+    print(f"\n=== Experiment 10: Epoch-Based Training (Buffer={buffer_size}, LR=0.0001) ===")
     os.makedirs(output_dir, exist_ok=True)
     
     # Load Data (Keep your existing loading code)
-    train_data = load_instances("approachesO3DKP/ga_mixed.pt")
+    train_data = load_instances("approachesO3DKP/ga_mixed_large.pt")
     val_cut1 = load_instances("approachesO3DKP/cut_1.pt")
     val_cut2 = load_instances("approachesO3DKP/cut_2.pt")
     val_rs = load_instances("approachesO3DKP/rs.pt")
@@ -742,9 +749,9 @@ def run_epoch_training(output_dir, train_episodes=10000, val_episodes=None, pati
     env = BoxPilingEnv()
     agent = DQNAgent(
         state_dims={'height_map': env.pallet_size, 'box_dims': 3},
-        action_size=5,
+        action_size=4,
         max_height=env.max_height,
-        learning_rate=0.001, # Start with 0.001
+        learning_rate=0.0001, # Start with 0.0001
         min_support_ratio=0.60,
         require_opposite_edge_support=True,
     )
@@ -760,7 +767,7 @@ def run_epoch_training(output_dir, train_episodes=10000, val_episodes=None, pati
     # e.g., 20 epochs * 10k episodes = 200k steps. 
     # We want to explore for at least the first 5-8 epochs.
     # 0.99995 ^ 50000 approx 0.08
-    agent.epsilon_decay = 0.99995 
+    agent.epsilon_decay = 0.999985 
     
     epoch_results = []
     best_avg_util = 0.0
@@ -777,6 +784,9 @@ def run_epoch_training(output_dir, train_episodes=10000, val_episodes=None, pati
         print(f"{'='*50}")
         
         import random
+        # Subsample N episodes from the large dataset (50k) for this epoch
+        # This prevents overheating on the same instances
+        train_subset = random.sample(train_data, min(len(train_data), train_episodes))
         random.shuffle(train_subset)
         
         train_out_dir = os.path.join(output_dir, f"epoch_{epoch}")
@@ -838,7 +848,7 @@ def run_epoch_training(output_dir, train_episodes=10000, val_episodes=None, pati
         plot_experiment_results(epoch_results, output_dir)
         
         # Save Best & Early Stopping
-        if avg_util > best_avg_util + 0.005: 
+        if avg_util >= best_avg_util: 
             best_avg_util = avg_util
             agent.save_model(best_model_path)
             epochs_without_improvement = 0
@@ -867,7 +877,7 @@ def save_visualizations(agent, episodes_boxes, output_dir, env_params, n_samples
     
     env = BoxPilingEnv()
     max_buffer_size = env_params.get('max_buffer_size', 0)
-    heuristic_map = {0: 'stacking', 1: 'best_fit', 2: 'semi_perfect_fit', 3: 'random_fit', 4: 'corner'}
+    heuristic_map = {0: 'stacking', 1: 'best_fit', 2: 'semi_perfect_fit', 3: 'corner'}
 
     for i, boxes in enumerate(samples):
         state = env.reset()
@@ -880,8 +890,11 @@ def save_visualizations(agent, episodes_boxes, output_dir, env_params, n_samples
             box_idx += 1
             state = env.new_box_arrival(box_dims)
             pred_mask = agent.predict_mask(state, buffer_count=len(buffer))
-            mask_bias = proxy_scores_for_heuristics(env, pred_mask)
-            h_idx = agent.act_with_mask_bias(state, buffer_count=len(buffer), mask_bias=mask_bias, beta=0.5)
+            mask_bias = proxy_scores_for_heuristics(
+                env.current_height_map, env.current_box, 
+                env.pallet_size, env.max_height, pred_mask
+            )
+            h_idx = agent.get_action_with_prior(state, mask_bias, buffer_count=len(buffer))
             heuristic = heuristic_map[h_idx]
             action, _ = env.choose_action_by_heuristic(heuristic, pred_mask=pred_mask)
             if action is None:
@@ -903,7 +916,13 @@ def save_visualizations(agent, episodes_boxes, output_dir, env_params, n_samples
             made_progress = False
             for box in buffer[:]:
                 state = env.new_box_arrival(box)
-                h_idx = agent.act_with_mask_bias(state, buffer_count=len(buffer), beta=0.5)
+                # For buffer items, we still need the two-pass logic
+                pred_mask = agent.predict_mask(state, buffer_count=len(buffer))
+                mask_bias = proxy_scores_for_heuristics(
+                    env.current_height_map, env.current_box, 
+                    env.pallet_size, env.max_height, pred_mask
+                )
+                h_idx = agent.get_action_with_prior(state, mask_bias, buffer_count=len(buffer))
                 action, _ = env.choose_action_by_heuristic(heuristic_map[h_idx], pred_mask=None)
                 if action is not None:
                     env.step(action); buffer.remove(box); made_progress = True
@@ -979,7 +998,7 @@ def train_one_epoch(agent, episodes_boxes, output_dir, env_params):
     q_losses = []
     mask_losses = []
     
-    heuristic_map = {0: 'stacking', 1: 'best_fit', 2: 'semi_perfect_fit', 3: 'random_fit', 4: 'corner'}
+    heuristic_map = {0: 'stacking', 1: 'best_fit', 2: 'semi_perfect_fit', 3: 'corner'}
     heuristic_counts = {k: 0 for k in heuristic_map.values()}
     total_decisions = 0
     all_metrics = []
@@ -1005,10 +1024,13 @@ def train_one_epoch(agent, episodes_boxes, output_dir, env_params):
             valid_mask_bool = mask_probs > 0.5
             
             # 3. Calculate Scores (Maximal Space Passthrough)
-            mask_bias = proxy_scores_for_heuristics(env, mask_probs)
+            mask_bias = proxy_scores_for_heuristics(
+                env.current_height_map, env.current_box, 
+                env.pallet_size, env.max_height, mask_probs
+            )
             
             # 4. Act
-            h_idx = agent.act_with_mask_bias(state, len(buffer), mask_bias, beta=BETA_VAL)
+            h_idx = agent.get_action_with_prior(state, mask_bias, len(buffer))
             heuristic = heuristic_map[h_idx]
             
             heuristic_counts[heuristic] += 1
@@ -1021,7 +1043,7 @@ def train_one_epoch(agent, episodes_boxes, output_dir, env_params):
             if action is None:
                 action, mapping = env.choose_action_by_heuristic(heuristic, pred_mask=None)
                 if action is None:
-                    agent.remember(state, h_idx, -5.0, state, False, len(buffer))
+                    agent.remember(state, h_idx, -0.5, state, False, len(buffer), mask_bias)
                     agent.replay()
                     if hasattr(agent, 'last_q_loss'): q_losses.append(agent.last_q_loss)
                     if hasattr(agent, 'last_mask_loss'): mask_losses.append(agent.last_mask_loss)
@@ -1035,7 +1057,7 @@ def train_one_epoch(agent, episodes_boxes, output_dir, env_params):
             
             # 6. Step & Learn
             next_state, reward, local_done, _ = env.step(action)
-            agent.remember(state, h_idx, reward, next_state, local_done, len(buffer))
+            agent.remember(state, h_idx, reward, next_state, local_done, len(buffer), mask_bias)
             agent.replay()
             
             if hasattr(agent, 'last_q_loss'): q_losses.append(agent.last_q_loss)
@@ -1045,7 +1067,7 @@ def train_one_epoch(agent, episodes_boxes, output_dir, env_params):
             if env._is_terminal(): done = True
             
             # Target Update (Frequency: per step count)
-            if agent.optimizer_step_count % 500 == 0:
+            if agent.optimizer_step_count % 2000 == 0:
                 agent.update_target_model()
         
         # --- END OF EPISODE UPDATES ---
@@ -1093,7 +1115,7 @@ if __name__ == "__main__":
     parser.add_argument("--episodes", type=int, default=10000, help="Number of training episodes per epoch")
     parser.add_argument("--val-episodes", type=int, default=None, help="Number of validation episodes")
     parser.add_argument("--max-epochs", type=int, default=20, help="Maximum number of epochs")
-    parser.add_argument("--patience", type=int, default=3, help="Early stopping patience")
+    parser.add_argument("--patience", type=int, default=12, help="Early stopping patience")
     parser.add_argument("--buffer-size", type=int, default=0, help="Buffer size for Experiment 10")
     args = parser.parse_args()
     

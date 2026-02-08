@@ -77,7 +77,7 @@ def compute_gt_mask(
     """
     L, W = pallet_size
     mask = np.zeros((2, L, W), dtype=np.float32)
-    rotations = [(0, 1, 2), (2, 1, 0)]
+    rotations = [(0, 1, 2), (1, 0, 2)]
     
     # First pass: find all valid positions and their flatness scores
     valid_positions = []
@@ -108,19 +108,20 @@ def compute_gt_mask(
                 flatness = calculate_average_flat_area(temp_hm)
                 valid_positions.append((r_idx, x, y, flatness))
 
-    # Second pass: normalize scores and populate mask
+    # Second pass: selective binary mask
     if len(valid_positions) > 0:
         scores = np.array([pos[3] for pos in valid_positions])
-        min_score = scores.min()
         max_score = scores.max()
         
+        # Define tolerance for float comparison (effectively selecting top-tier spots)
+        tolerance = 1e-5
+        
         for r_idx, x, y, flatness in valid_positions:
-            if max_score - min_score > 1e-6:
-                # Normalize to [0.5, 1.0] range
-                normalized = 0.5 + 0.5 * (flatness - min_score) / (max_score - min_score)
+            # Binary Mask: 1.0 if it matches the best possible flatness, 0.0 otherwise
+            if flatness >= max_score - tolerance:
+                 mask[r_idx, x, y] = 1.0
             else:
-                normalized = 1.0
-            mask[r_idx, x, y] = normalized
+                 mask[r_idx, x, y] = 0.0
 
     return mask
 
@@ -162,7 +163,7 @@ class BoxPilingEnv:
         return self._get_state()
 
     def get_rotated_box_dims(self, box, rotation):
-        valid_rotations = [(0, 1, 2), (2, 1, 0)]  # (L,W,H) and (H,W,L)
+        valid_rotations = [(0, 1, 2), (1, 0, 2)]  # (L,W,H) and (W,L,H) - "This Side Up"
         return tuple(int(box[i]) for i in valid_rotations[rotation])
 
     def _is_valid_placement(self, x, y, w, d, h):
@@ -400,33 +401,7 @@ class BoxPilingEnv:
                     best_score, best_action = score, action
         return best_action
 
-    def heuristic_random_fit(self, valid_actions):
-        """
-        [cite_start]Paper: "Initially 66.67% stacking... by end, semi-perfect fit rises to 66.67%"[cite: 311, 313].
-        [cite_start]"The best shifting point for Cut-1 and RS is 10%"[cite: 318, 319].
-        """
-        if not valid_actions:
-            return None
 
-        # Calculate Utilization
-        pallet_vol = self.pallet_size[0] * self.pallet_size[1] * self.max_height
-        placed_vol = sum(b[2]*b[3]*b[4] for b in self.placed_boxes)
-        utilization = placed_vol / pallet_vol if pallet_vol > 0 else 0
-        
-        # Paper threshold logic
-        threshold = 0.10 
-        
-        if utilization < threshold:
-            # Early game: 66% Stacking, 33% Semi-Perfect
-            p_stack = 0.66
-        else:
-            # Late game: 33% Stacking, 66% Semi-Perfect
-            p_stack = 0.33
-            
-        if np.random.rand() < p_stack:
-            return self.heuristic_stacking(valid_actions)
-        else:
-            return self.heuristic_semi_perfect_fit(valid_actions)
 
     def heuristic_corner(self, valid_actions):
         """
@@ -480,15 +455,14 @@ class BoxPilingEnv:
             action = self.heuristic_best_fit(valid_actions)
         elif heuristic_name == 'semi_perfect_fit':
             action = self.heuristic_semi_perfect_fit(valid_actions)
-        elif heuristic_name == 'random_fit':
-            action = self.heuristic_random_fit(valid_actions)
         elif heuristic_name == 'corner':
             action = self.heuristic_corner(valid_actions)
         else:
-            raise ValueError("Unknown heuristic")
+            raise ValueError(f"Unknown heuristic: {heuristic_name}")
 
         if action not in valid_actions:
-            action = random.choice(valid_actions)
+            # Fallback to FIRST valid action to be deterministic
+            action = valid_actions[0]
         return action, mapping[str(action)]
 
     def step(self, action):
@@ -502,17 +476,29 @@ class BoxPilingEnv:
         valid, base_z = self._is_valid_placement(xx, yy, w, d, h)
         if not valid:
             self.invalid_actions_attempted += 1
-            reward = -5
+            reward = -0.5
             return self._get_state(), reward, False, {"invalid": True}
+
+        # Calculate Old Flatness
+        old_flatness = self._calculate_maximal_flat_area(self.current_height_map)
 
         self._update_height_map(xx, yy, w, d, h, base_z)
         self.placed_boxes.append((xx, yy, w, d, h, base_z))
 
-        # Reward: Volume Utilization
+        # Calculate New Flatness
+        new_flatness = self._calculate_maximal_flat_area(self.current_height_map)
+
+        # Reward: Volume Utilization + Flatness Delta
         # (Box Volume / Pallet Volume) * Scale
         pallet_vol = self.pallet_size[0] * self.pallet_size[1] * self.max_height
         box_vol = w * d * h
-        reward = (box_vol / pallet_vol) * 10 # Scaling factor
+        
+        # New Reward Formula (Normalized ~ 0.0 - 1.2)
+        r_vol = box_vol / pallet_vol
+        # Normalized flatness delta relative to surface area
+        r_flat = (new_flatness - old_flatness) / (self.pallet_size[0] * self.pallet_size[1])
+        
+        reward = r_vol + (r_flat * 0.1)
         
         self.current_box = None
         done = False # controlled by stream
@@ -561,7 +547,7 @@ class DQNAgent:
         require_opposite_edge_support=True,
     ):
         self.state_dims = state_dims
-        self.action_size = action_size
+        self.action_size = 4
         self.max_height = max_height
         self.learning_rate = learning_rate
 
@@ -571,7 +557,7 @@ class DQNAgent:
         self.model = self._build_model().to(self.device)
         self.target_model = self._build_model().to(self.device)
         
-        self.optimizer = optim.RMSprop(self.model.parameters(), lr=self.learning_rate)
+        self.optimizer = optim.Adam(self.model.parameters(), lr=0.0001, eps=1e-8)
 
         # FIX 1: Large Memory for Epoch Training
         self.memory = []
@@ -589,37 +575,32 @@ class DQNAgent:
     # ------------------------------------------------------------------
     # FIX 2: SPATIAL STACKING (The "Pro" Input Method)
     # ------------------------------------------------------------------
-    def _norm(self, state, buffer_count=0):
+    def _norm(self, state, buffer_count=0, proxy_scores=None):
         L, W = self.state_dims['height_map']
         
-        # 1. Height Map (Channel 0)
-        # Normalize to [0, 1]
+        # 1. Height Map (Channel 0) -> Spatial Branch
         hm = state['height_map'] / float(self.max_height)
+        hm_tensor = torch.FloatTensor(hm).unsqueeze(0).unsqueeze(0).to(self.device) # (1, 1, 10, 10)
         
-        # 2. Box Dimensions Stretched (Channels 1, 2, 3)
-        # We "stretch" the 3 scalars to cover the whole 10x10 grid.
-        # This allows the Conv layers to do pixel-wise comparisons.
+        # 2. Vector Features -> Vector Branch
+        # [BoxL, BoxW, BoxH, BufCount, S1, S2, S3, S4]
         box_dims = state['box_dims']
-        box_tensor = np.zeros((3, L, W), dtype=np.float32)
-        
         if np.sum(box_dims) > 0:
-            box_tensor[0, :, :] = box_dims[0] / L           # Normalized Length
-            box_tensor[1, :, :] = box_dims[1] / W           # Normalized Width
-            box_tensor[2, :, :] = box_dims[2] / self.max_height # Normalized Height
+            bd_norm = [box_dims[0]/L, box_dims[1]/W, box_dims[2]/self.max_height]
+        else:
+            bd_norm = [0, 0, 0]
+            
+        buf_norm = [min(buffer_count, 10) / 10.0]
         
-        # 3. Stack -> Shape (1, 4, 10, 10)
-        # Channel 0: Height Map
-        # Channel 1: Box Length (every pixel is l_norm)
-        # Channel 2: Box Width (every pixel is w_norm)
-        # Channel 3: Box Height (every pixel is h_norm)
-        combined_state = np.concatenate([hm[np.newaxis, :, :], box_tensor], axis=0)
+        if proxy_scores is None:
+            scores = [0.0] * 4
+        else:
+            scores = proxy_scores[:4]
+
+        vec = bd_norm + buf_norm + scores
+        vec_tensor = torch.FloatTensor(vec).unsqueeze(0).to(self.device)
         
-        # 4. Buffer feature (Scalar)
-        buf = np.array([min(buffer_count, 10) / 10.0], dtype=np.float32)
-        
-        return (torch.FloatTensor(combined_state).unsqueeze(0).to(self.device),
-                None, # Box dims are now inside the conv input!
-                torch.FloatTensor(buf).unsqueeze(0).to(self.device))
+        return hm_tensor, vec_tensor
 
     def _build_model(self):
         class ProNet(nn.Module):
@@ -628,53 +609,64 @@ class DQNAgent:
                 L, W = pallet_size
                 self.L, self.W = L, W
                 
-                # FIX 3: 4 Input Channels, Stride=1 (No compression)
-                self.conv = nn.Sequential(
-                    nn.Conv2d(4, 64, 3, padding=1), nn.ReLU(),
+                # Branch A: Spatial (Height Map only, 1 channel)
+                self.spatial = nn.Sequential(
+                    nn.Conv2d(1, 64, 3, padding=1), nn.ReLU(),
                     nn.Conv2d(64, 64, 3, padding=1), nn.ReLU(),
                     nn.Conv2d(64, 64, 3, padding=1), nn.ReLU(),
                     nn.Flatten()
                 )
+                spatial_out_size = 64 * L * W
                 
-                # Output is 64 * 10 * 10 = 6400 features
-                conv_out_size = 64 * L * W 
+                # Branch B: Vector (Box + Buffer + Scores = 8 dims)
+                self.vector = nn.Sequential(
+                    nn.Linear(8, 64), nn.ReLU(),
+                    nn.Linear(64, 64), nn.ReLU()
+                )
+                
+                # Fusion
+                fusion_size = spatial_out_size + 64
                 
                 # Critic Head (Value)
                 self.val = nn.Sequential(
-                    nn.Linear(conv_out_size + 1, 512), nn.ReLU(), 
+                    nn.Linear(fusion_size, 512), nn.ReLU(), 
                     nn.Linear(512, 1)
                 )
                 
                 # Actor Head (Advantage)
                 self.adv = nn.Sequential(
-                    nn.Linear(conv_out_size + 1, 512), nn.ReLU(), 
+                    nn.Linear(fusion_size, 512), nn.ReLU(), 
                     nn.Linear(512, action_size)
                 )
                 
-                # Mask Head (Auxiliary)
+                # Mask Head (Auxiliary) - Branches from Spatial only
                 self.mask_head = nn.Sequential(
-                    nn.Linear(conv_out_size + 1, 512), nn.ReLU(),
+                    nn.Linear(spatial_out_size, 512), nn.ReLU(),
                     nn.Linear(512, 2 * L * W)
                 )
 
-            def forward(self, combined_state, _, buf):
-                f = self.conv(combined_state)
-                # Inject buffer status into dense layers
-                z = torch.cat([f, buf], dim=1)
+            def forward(self, hm_tensor, vec_tensor):
+                s_feat = self.spatial(hm_tensor)
+                v_feat = self.vector(vec_tensor)
                 
-                v = self.val(z)
-                a = self.adv(z)
+                # Fuse
+                combined = torch.cat([s_feat, v_feat], dim=1)
+                
+                v = self.val(combined)
+                a = self.adv(combined)
                 q = v + (a - a.mean(dim=1, keepdim=True))
-                mask_logits = self.mask_head(z).view(-1, 2, self.L, self.W)
+                
+                # Mask prediction uses ONLY spatial features
+                mask_logits = self.mask_head(s_feat).view(-1, 2, self.L, self.W)
+                
                 return q, mask_logits
 
         return ProNet(self.state_dims['height_map'], self.action_size)
 
     # --- Standard Methods (Updated for new input shape) ---
 
-    def remember(self, s, a, r, ns, d, buffer_count):
+    def remember(self, s, a, r, ns, d, buffer_count, proxy_scores):
         # We re-compute mask here or passed in. 
-        # Assuming your old code logic for mask computation is available.
         L, W = self.state_dims['height_map']
         hm_raw = s['height_map']
         bd_raw = s['box_dims']
@@ -685,32 +677,25 @@ class DQNAgent:
         else:
             gt_mask = np.zeros((2, L, W), dtype=np.float32)
             
-        self.memory.append((s, a, r, ns, d, buffer_count, gt_mask))
+        self.memory.append((s, a, r, ns, d, buffer_count, gt_mask, proxy_scores))
         if len(self.memory) > self.memory_size:
             self.memory.pop(0)
 
     @torch.no_grad()
-    def act_with_mask_bias(self, state, buffer_count=0, mask_bias=None, beta=0.5, eps=1e-6):
+    def get_action_with_prior(self, state, proxy_scores, buffer_count=0):
         if np.random.rand() <= self.epsilon:
             return int(np.random.randint(0, self.action_size))
         
-        combined, _, buf = self._norm(state, buffer_count)
-        q, _ = self.model(combined, None, buf) # Pass None for box_dims
-        q = q.squeeze(0)
-        
-        if mask_bias is not None:
-            b = torch.tensor(mask_bias, dtype=torch.float32).to(self.device)
-            # Normalize bias locally
-            if b.std() > 1e-6:
-                b = (b - b.mean()) / (b.std())
-            q = q + beta * b
-            
+        # Pass scores to norm
+        hm_t, vec_t = self._norm(state, buffer_count, proxy_scores)
+        q, _ = self.model(hm_t, vec_t)
         return int(torch.argmax(q).item())
 
     @torch.no_grad()
     def predict_mask(self, state, buffer_count=0, threshold=0.5):
-        combined, _, buf = self._norm(state, buffer_count)
-        _, ml = self.model(combined, None, buf)
+        # No proxy scores needed for mask
+        hm_t, vec_t = self._norm(state, buffer_count)
+        _, ml = self.model(hm_t, vec_t)
         return (torch.sigmoid(ml)[0].cpu().numpy() > threshold)
     
     @torch.no_grad()
@@ -719,50 +704,83 @@ class DQNAgent:
         Returns the raw continuous scores (0.0 to 1.0) from the mask head.
         Used for the 'Maximal Space Passthrough' investigation.
         """
-        combined, _, buf = self._norm(state, buffer_count)
-        # Pass None for box_dims as they are embedded in 'combined' for ProNet
-        _, ml = self.model(combined, None, buf)
+        hm_t, vec_t = self._norm(state, buffer_count)
+        _, ml = self.model(hm_t, vec_t)
         return torch.sigmoid(ml)[0].cpu().numpy()
 
     def replay(self):
         if len(self.memory) < self.batch_size:
             return
         
+    def replay(self):
+        if len(self.memory) < self.batch_size:
+            return
+        
         batch = random.sample(self.memory, self.batch_size)
-        states, actions, rewards, next_states, dones, buffer_counts, gt_masks_list = zip(*batch)
+        states, actions, rewards, next_states, dones, buffer_counts, gt_masks_list, proxy_scores_list = zip(*batch)
 
         L, W = self.state_dims['height_map']
         
-        # Helper to batch process the "Spatial Stacking"
-        def process_batch_states(s_list):
-            processed = []
-            for s in s_list:
+        # Helper to batch process Inputs
+        def prepare_batch(s_list, buf_list, scores_list):
+            hm_list = []
+            vec_list = []
+            for i, s in enumerate(s_list):
+                # Spatial
                 hm = s['height_map'] / float(self.max_height)
+                hm_list.append(hm[np.newaxis, :, :])
+                
+                # Vector
                 bd = s['box_dims']
-                bt = np.zeros((3, L, W), dtype=np.float32)
                 if np.sum(bd) > 0:
-                    bt[0] = bd[0]/L
-                    bt[1] = bd[1]/W
-                    bt[2] = bd[2]/self.max_height
-                combined = np.concatenate([hm[np.newaxis, :, :], bt], axis=0)
-                processed.append(combined)
-            return np.array(processed, dtype=np.float32)
+                    bd_norm = [bd[0]/L, bd[1]/W, bd[2]/self.max_height]
+                else:
+                    bd_norm = [0, 0, 0]
+                
+                buf_norm = [min(buf_list[i], 10) / 10.0]
+                
+                if scores_list is None:
+                    sc = [0.0]*4
+                else:
+                    sc = scores_list[i]
+                
+                vec_list.append(bd_norm + buf_norm + sc)
+                
+            hm_tensor = torch.FloatTensor(np.array(hm_list)).to(self.device)
+            vec_tensor = torch.FloatTensor(np.array(vec_list)).to(self.device)
+            return hm_tensor, vec_tensor
 
-        s_batch = torch.FloatTensor(process_batch_states(states)).to(self.device)
-        ns_batch = torch.FloatTensor(process_batch_states(next_states)).to(self.device)
-        
-        bc_batch = torch.FloatTensor(np.array(buffer_counts)).unsqueeze(1).to(self.device)
-        bc_batch = torch.clamp(bc_batch, 0, 10) / 10.0
-        
+        # 1. Current State
+        hm_curr, vec_curr = prepare_batch(states, buffer_counts, proxy_scores_list)
         gt_masks = torch.from_numpy(np.array(gt_masks_list, dtype=np.float32)).to(self.device)
         
-        # Forward pass (Note: None for box_dims arg)
-        q_cur, mask_logits = self.model(s_batch, None, bc_batch)
+        # Forward pass
+        q_cur, mask_logits = self.model(hm_curr, vec_curr)
         q_cur = q_cur.gather(1, torch.LongTensor(actions).to(self.device).unsqueeze(1)).squeeze(1)
         
+        # 2. Next State
+        # Need to predict next mask to get next proxy scores
         with torch.no_grad():
-            q_next, _ = self.target_model(ns_batch, None, bc_batch)
-            q_next, _ = q_next.max(1)
+             # We pass None for scores first just to get mask
+             hm_next, vec_next_dummy = prepare_batch(next_states, buffer_counts, None)
+             _, mask_logits_next = self.target_model(hm_next, vec_next_dummy)
+             mask_probs_next = torch.sigmoid(mask_logits_next).cpu().numpy()
+             
+             # Compute Next Proxy Scores per sample
+             next_scores_list = []
+             for i in range(len(next_states)):
+                 ns = next_states[i]
+                 sc = proxy_scores_for_heuristics(
+                     ns['height_map'], ns['box_dims'], 
+                     (L, W), self.max_height, 
+                     mask_probs_next[i]
+                 )
+                 next_scores_list.append(sc)
+            
+             # Now fully prepare next inputs
+             hm_next, vec_next = prepare_batch(next_states, buffer_counts, next_scores_list)
+             q_next, _ = self.target_model(hm_next, vec_next)
+             q_next, _ = q_next.max(1)
             
         dones_t = torch.FloatTensor([1.0 if d else 0.0 for d in dones]).to(self.device)
         rewards_t = torch.FloatTensor(rewards).to(self.device)
@@ -771,12 +789,14 @@ class DQNAgent:
         q_loss = nn.SmoothL1Loss()(q_cur, tgt)
         
         # Mask Loss (Only for valid boxes)
-        # Check channel 1 (Box Length) > 0
-        has_box = (s_batch[:, 1, 0, 0] > 0).float()
+        # Check if box exists (box_dims sum > 0)
+        has_box = torch.tensor([1.0 if np.sum(s['box_dims']) > 0 else 0.0 for s in states]).to(self.device)
         
-        mask_preds = torch.sigmoid(mask_logits)
-        # Mean over pixels (dim 1,2,3 -> channels, h, w)
-        per_sample_loss = ((mask_preds - gt_masks) ** 2).mean(dim=(1,2,3))
+        # Use BCEWithLogitsLoss for binary mask
+        # reduction='none' so we can apply has_box mask
+        per_pixel_loss = nn.BCEWithLogitsLoss(reduction='none')(mask_logits, gt_masks)
+        per_sample_loss = per_pixel_loss.mean(dim=(1,2,3)) # Mean over C, H, W
+        
         mask_loss = (per_sample_loss * has_box).sum() / (has_box.sum() + 1e-6)
         
         loss = q_loss + self.mask_loss_weight * mask_loss
@@ -785,7 +805,7 @@ class DQNAgent:
         loss.backward()
         torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
         self.optimizer.step()
-        self.optimizer_step_count += 1 # Important for target update
+        self.optimizer_step_count += 1 
 
         self.last_q_loss = q_loss.item()
         self.last_mask_loss = mask_loss.item()
@@ -810,25 +830,26 @@ class DQNAgent:
 
 
 
-def proxy_scores_for_heuristics(env_obj, pred_mask_probs):
+def proxy_scores_for_heuristics(height_map, box_dims, pallet_size, max_height, pred_mask_probs):
     """
     Directly maps the Heuristic's chosen position to the Mask's predicted score.
-    Since the Mask is trained on 'Maximal Spaces', this score IS the Maximal Space quality.
+    Refactored to be stateless (accepts params instead of env object).
     """
-    # Index: 0=Stacking, 1=BestFit, 2=SemiPerfect, 3=Random, 4=Corner
-    scores = [0.0] * 5 
+    # Index: 0=Stacking, 1=BestFit, 2=SemiPerfect, 3=Corner
+    scores = [0.0] * 4 
     
-    box = env_obj.current_box
-    if box is None: return scores
+    if np.sum(box_dims) == 0: return scores # No box
 
-    Lp, Wp = env_obj.pallet_size
-    max_h = env_obj.max_height
-    hm = env_obj.current_height_map
-    rot_dims = [env_obj.get_rotated_box_dims(box, 0), env_obj.get_rotated_box_dims(box, 1)]
-
-    # We want to find the specific (x,y) that each heuristic would choose,
-    # then grab the mask_probability at that exact coordinate.
+    Lp, Wp = pallet_size
     
+    # Helper for rotation
+    def get_rotated(bd, rot):
+        # rot 0: L, W, H. rot 1: W, L, H.
+        if rot == 0: return int(bd[0]), int(bd[1]), int(bd[2])
+        return int(bd[1]), int(bd[0]), int(bd[2])
+        
+    rot_dims = [get_rotated(box_dims, 0), get_rotated(box_dims, 1)]
+
     # Init with (Metric, MaskScore)
     # Stacking Metric: -Z
     best_stack = (-float('inf'), 0.0)
@@ -856,20 +877,21 @@ def proxy_scores_for_heuristics(env_obj, pred_mask_probs):
         for i in range(len(candidates)):
             xx, yy = candidates[i]
             
-            # THE CORE: This value represents "Maximal Space Quality" (from your GT definition)
             maximal_space_score = mask_probs[xx, yy]
             
-            # --- Re-run Heuristic Logic to identify the chosen spot ---
-            region = hm[xx:xx + w, yy:yy + d]
-            support_z = np.max(region)
-            gap = max_h - (support_z + h)
+            # --- Re-run Heuristic Logic ---
+            region = height_map[xx:xx + w, yy:yy + d]
+            base_z = np.max(region)
+            
+            if base_z + h > max_height: continue # Basic validity check (should be caught by mask hopefully but safety first)
+            
+            gap = max_height - (base_z + h)
             
             # 1. Stacking (Maximize -Z)
-            m_stack = -support_z
+            m_stack = -base_z
             if m_stack > best_stack[0]:
                 best_stack = (m_stack, maximal_space_score)
             elif m_stack == best_stack[0]:
-                # Tie-breaker: If heights are equal, prefer the better Maximal Space
                 best_stack = (m_stack, max(best_stack[1], maximal_space_score))
 
             # 2. Best Fit (Maximize -Gap)
@@ -880,7 +902,7 @@ def proxy_scores_for_heuristics(env_obj, pred_mask_probs):
                 best_bf = (m_bf, max(best_bf[1], maximal_space_score))
 
             # 3. Semi-Perfect (Maximize -Waste)
-            support_count = np.sum(region == support_z)
+            support_count = np.sum(region == base_z)
             waste = (w * d) - support_count
             m_semi = -(waste + gap)
             if m_semi > best_semi[0]:
@@ -906,8 +928,7 @@ def proxy_scores_for_heuristics(env_obj, pred_mask_probs):
     scores[0] = best_stack[1]
     scores[1] = best_bf[1]
     scores[2] = best_semi[1]
-    scores[3] = 0.5 
-    scores[4] = best_corn[1]
+    scores[3] = best_corn[1]
     
     return scores
 # ===========================================
@@ -919,11 +940,11 @@ def train(
     model_save_path=None,
     verbose=False,
     episode_to_show=100,
-    defer_penalty=-5.0,
+    defer_penalty=-0.5,
     mask_bias_beta=0.5,
     learning_rate=0.001,
     max_buffer_size=float('inf'),
-    min_support_ratio=0.50,
+    min_support_ratio=0.60,
     require_opposite_edge_support=True,
     return_agent=False,
 ):

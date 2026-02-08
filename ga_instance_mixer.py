@@ -254,10 +254,10 @@ def generate_ga_mixed_instances(
 
 summary = generate_ga_mixed_instances(
     input_paths=["approachesO3DKP/cut_1.pt", "approachesO3DKP/cut_2.pt", "approachesO3DKP/rs.pt"],
-    output_path="approachesO3DKP/ga_mixed.pt",
+    output_path="approachesO3DKP/ga_mixed_large.pt",
     generations=100,
     population_size=10000,
-    n_output_episodes=10000,
+    n_output_episodes=50000,
     keep_episode_lengths=True,
     target_fill=0.85,
     alpha_diversity=0.12,
