@@ -443,6 +443,59 @@ class BoxPilingEnv:
                     best_score, best_action = score, action
         return best_action
 
+    def heuristic_complex_fit(self, valid_actions):
+        """
+        [cite_start]Paper (Ref): Prioritizes placements where Replication Score is high.[cite: 4.3.5]
+        Logic: Look for "Gaps" (distance to nearest wall or taller box) that are perfect multiples 
+        of the current box's dimensions.
+        """
+        best_action, best_score = None, -np.inf # Higher is better
+        L, W = self.pallet_size
+
+        for action in valid_actions:
+            rotation = action % 2
+            remaining = action // 2
+            yy = remaining % self.pallet_size[1]
+            xx = remaining // self.pallet_size[1]
+            w, d, h = self.get_rotated_box_dims(self.current_box, rotation)
+            
+            valid, z = self._is_valid_placement(xx, yy, w, d, h)
+            if valid:
+                # 1. Measure Gap in X (from xx to nearest wall/taller-box)
+                gap_x = 0
+                for ix in range(xx + w, L):
+                    if np.any(self.current_height_map[ix, yy:yy+d] > z): break
+                    gap_x += 1
+                else: gap_x = L - (xx + w) # hit wall
+                
+                # 2. Measure Gap in Y
+                gap_y = 0
+                for iy in range(yy + d, W):
+                    if np.any(self.current_height_map[xx:xx+w, iy] > z): break
+                    gap_y += 1
+                else: gap_y = W - (yy + d) # hit wall
+                
+                # Full gap including current box
+                full_gap_x = gap_x + w
+                full_gap_y = gap_y + d
+                
+                # Replication Scoring: residue=0 is perfect.
+                residue_x = full_gap_x % w
+                residue_y = full_gap_y % d
+                
+                # Inverse residue score (Penalty for gaps that aren't multiples)
+                # Perfect match in both = 2000.
+                score = (1.0 if residue_x == 0 else 0.0) * 1000 + \
+                        (1.0 if residue_y == 0 else 0.0) * 1000
+                
+                # Tie-breakers: Tight packing + Gravity
+                contact = self._get_contact_score(xx, yy, w, d, z)
+                score += (contact * 10) - z
+                
+                if score > best_score:
+                    best_score, best_action = score, action
+        return best_action
+
     def choose_action_by_heuristic(self, heuristic_name, pred_mask=None):
         valid_actions, mapping = self.get_valid_actions(self.current_box, pred_mask=pred_mask)
         if not valid_actions:
@@ -457,6 +510,8 @@ class BoxPilingEnv:
             action = self.heuristic_semi_perfect_fit(valid_actions)
         elif heuristic_name == 'corner':
             action = self.heuristic_corner(valid_actions)
+        elif heuristic_name == 'complex_fit':
+            action = self.heuristic_complex_fit(valid_actions)
         else:
             raise ValueError(f"Unknown heuristic: {heuristic_name}")
 
@@ -548,7 +603,7 @@ class DQNAgent:
     ):
         self.state_dims = state_dims
         self.pallet_size = state_dims['height_map']
-        self.action_size = 4
+        self.action_size = action_size
         self.max_height = max_height
         self.learning_rate = learning_rate
 
@@ -572,7 +627,6 @@ class DQNAgent:
         
         self.mask_loss_weight = 0.15
         self.optimizer_step_count = 0
-        self.tau = 0.005 # Soft update parameter
 
     # ------------------------------------------------------------------
     # FIX 2: SPATIAL STACKING (The "Pro" Input Method)
@@ -595,9 +649,9 @@ class DQNAgent:
         buf_norm = [min(buffer_count, 10) / 10.0]
         
         if proxy_scores is None:
-            scores = [0.0] * 4
+            scores = [0.0] * 5
         else:
-            scores = proxy_scores[:4]
+            scores = proxy_scores[:5]
 
         vec = bd_norm + buf_norm + scores
         vec_tensor = torch.FloatTensor(vec).unsqueeze(0).to(self.device)
@@ -620,9 +674,9 @@ class DQNAgent:
                 )
                 spatial_out_size = 64 * L * W
                 
-                # Branch B: Vector (Box + Buffer + Scores = 8 dims)
+                # Branch B: Vector (Box + Buffer + Scores = 9 dims)
                 self.vector = nn.Sequential(
-                    nn.Linear(8, 64), nn.ReLU(),
+                    nn.Linear(9, 64), nn.ReLU(),
                     nn.Linear(64, 64), nn.ReLU()
                 )
                 
@@ -715,7 +769,7 @@ class DQNAgent:
             else:
                 bd_norm = [0, 0, 0]
             buf_norm = [min(buffer_counts[i], 10) / 10.0]
-            sc = [0.0]*4
+            sc = [0.0]*5
             vec_list.append(bd_norm + buf_norm + sc)
             
         hm_t = torch.FloatTensor(np.array(hm_list)).to(self.device)
@@ -797,7 +851,7 @@ class DQNAgent:
                 buf_norm = [min(buf_list[i], 10) / 10.0]
                 
                 if scores_list is None:
-                    sc = [0.0]*4
+                    sc = [0.0]*5
                 else:
                     sc = scores_list[i]
                 
@@ -815,33 +869,29 @@ class DQNAgent:
         q_cur, mask_logits = self.model(hm_curr, vec_curr)
         q_cur = q_cur.gather(1, torch.LongTensor(actions).to(self.device).unsqueeze(1)).squeeze(1)
         
-        # 2. Next State (Double DQN Logic)
+        # 2. Next State
+        # Need to predict next mask to get next proxy scores
         with torch.no_grad():
-            # Use online model to select best action, Target model to evaluate it.
-            hm_next, vec_next_dummy = prepare_batch(next_states, buffer_counts, None)
-            q_next_online, mask_logits_next = self.model(hm_next, vec_next_dummy)
-            mask_probs_next = torch.sigmoid(mask_logits_next).cpu().numpy()
+             # We pass None for scores first just to get mask
+             hm_next, vec_next_dummy = prepare_batch(next_states, buffer_counts, None)
+             _, mask_logits_next = self.target_model(hm_next, vec_next_dummy)
+             mask_probs_next = torch.sigmoid(mask_logits_next).cpu().numpy()
+             
+             # Compute Next Proxy Scores per sample
+             next_scores_list = []
+             for i in range(len(next_states)):
+                 ns = next_states[i]
+                 sc = proxy_scores_for_heuristics(
+                     ns['height_map'], ns['box_dims'], 
+                     (L, W), self.max_height, 
+                     mask_probs_next[i]
+                 )
+                 next_scores_list.append(sc)
             
-            # Best actions according to Online Model
-            next_actions_online = q_next_online.argmax(dim=1)
-            
-            # Compute Next Proxy Scores per sample
-            next_scores_list = []
-            for i in range(len(next_states)):
-                ns = next_states[i]
-                sc = proxy_scores_for_heuristics(
-                    ns['height_map'], ns['box_dims'], 
-                    (L, W), self.max_height, 
-                    mask_probs_next[i]
-                )
-                next_scores_list.append(sc)
-            
-            # Now fully prepare next inputs
-            hm_next, vec_next = prepare_batch(next_states, buffer_counts, next_scores_list)
-            q_next_target, _ = self.target_model(hm_next, vec_next)
-            
-            # Double DQN evaluation: evaluate next_actions_online with q_next_target
-            q_next = q_next_target.gather(1, next_actions_online.unsqueeze(1)).squeeze(1)
+             # Now fully prepare next inputs
+             hm_next, vec_next = prepare_batch(next_states, buffer_counts, next_scores_list)
+             q_next, _ = self.target_model(hm_next, vec_next)
+             q_next, _ = q_next.max(1)
             
         dones_t = torch.FloatTensor([1.0 if d else 0.0 for d in dones]).to(self.device)
         rewards_t = torch.FloatTensor(rewards).to(self.device)
@@ -867,18 +917,12 @@ class DQNAgent:
         torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
         self.optimizer.step()
         self.optimizer_step_count += 1 
-        self.update_target_model(soft=True)
 
         self.last_q_loss = q_loss.item()
         self.last_mask_loss = mask_loss.item()
 
-    def update_target_model(self, soft=True):
-        if soft:
-            # Polyak Averaging: target = tau * model + (1-tau) * target
-            for target_param, param in zip(self.target_model.parameters(), self.model.parameters()):
-                target_param.data.copy_(self.tau * param.data + (1.0 - self.tau) * target_param.data)
-        else:
-            self.target_model.load_state_dict(self.model.state_dict())
+    def update_target_model(self):
+        self.target_model.load_state_dict(self.model.state_dict())
 
     def save_model(self, path):
         torch.save({
@@ -902,8 +946,8 @@ def proxy_scores_for_heuristics(height_map, box_dims, pallet_size, max_height, p
     Directly maps the Heuristic's chosen position to the Mask's predicted score.
     Refactored to be stateless (accepts params instead of env object).
     """
-    # Index: 0=Stacking, 1=BestFit, 2=SemiPerfect, 3=Corner
-    scores = [0.0] * 4 
+    # Index: 0=Stacking, 1=BestFit, 2=SemiPerfect, 3=Corner, 4=ComplexFit
+    scores = [0.0] * 5 
     
     if np.sum(box_dims) == 0: return scores # No box
 
@@ -926,6 +970,8 @@ def proxy_scores_for_heuristics(height_map, box_dims, pallet_size, max_height, p
     best_semi = (-float('inf'), 0.0)
     # Corner Metric: Walls
     best_corn = (-float('inf'), 0.0)
+    # ComplexFit Metric: BlockFit
+    best_comp = (-float('inf'), 0.0)
 
     found_valid = False
 
@@ -989,6 +1035,26 @@ def proxy_scores_for_heuristics(height_map, box_dims, pallet_size, max_height, p
             elif m_corn == best_corn[0]:
                 best_corn = (m_corn, max(best_corn[1], maximal_space_score))
 
+            # 5. Complex Fit (Maximize Replication potential)
+            gap_x = 0
+            for ix in range(xx + w, Lp):
+                if np.any(height_map[ix, yy:yy+d] > base_z): break
+                gap_x += 1
+            else: gap_x = Lp - (xx + w)
+            gap_y = 0
+            for iy in range(yy + d, Wp):
+                if np.any(height_map[xx:xx+w, iy] > base_z): break
+                gap_y += 1
+            else: gap_y = Wp - (yy + d)
+            
+            residue_x = (gap_x + w) % w
+            residue_y = (gap_y + d) % d
+            m_comp = (1.0 if residue_x == 0 else 0.0) + (1.0 if residue_y == 0 else 0.0)
+            if m_comp > best_comp[0]:
+                best_comp = (m_comp, maximal_space_score)
+            elif m_comp == best_comp[0]:
+                best_comp = (m_comp, max(best_comp[1], maximal_space_score))
+
     if not found_valid: return scores
 
     # Return the Maximal Space Score associated with each heuristic's choice
@@ -996,6 +1062,7 @@ def proxy_scores_for_heuristics(height_map, box_dims, pallet_size, max_height, p
     scores[1] = best_bf[1]
     scores[2] = best_semi[1]
     scores[3] = best_corn[1]
+    scores[4] = best_comp[1]
     
     return scores
 # ===========================================
@@ -1028,7 +1095,7 @@ def train(
     total_episodes = len(episodes_boxes)
     total_utilization = 0.0
     all_metrics = []
-    heuristic_map = {0: 'stacking', 1: 'best_fit', 2: 'semi_perfect_fit', 3: 'random_fit', 4: 'corner'}
+    heuristic_map = {0: 'stacking', 1: 'best_fit', 2: 'semi_perfect_fit', 3: 'corner', 4: 'complex_fit'}
 
     # Use tqdm for progress bar
     pbar = tqdm(range(total_episodes), desc="Training", unit="ep")

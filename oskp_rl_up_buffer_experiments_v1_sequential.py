@@ -547,7 +547,6 @@ class DQNAgent:
         require_opposite_edge_support=True,
     ):
         self.state_dims = state_dims
-        self.pallet_size = state_dims['height_map']
         self.action_size = 4
         self.max_height = max_height
         self.learning_rate = learning_rate
@@ -558,7 +557,7 @@ class DQNAgent:
         self.model = self._build_model().to(self.device)
         self.target_model = self._build_model().to(self.device)
         
-        self.optimizer = optim.Adam(self.model.parameters(), lr=self.learning_rate, eps=1e-8)
+        self.optimizer = optim.Adam(self.model.parameters(), lr=0.0001, eps=1e-8)
 
         # FIX 1: Large Memory for Epoch Training
         self.memory = []
@@ -572,7 +571,6 @@ class DQNAgent:
         
         self.mask_loss_weight = 0.15
         self.optimizer_step_count = 0
-        self.tau = 0.005 # Soft update parameter
 
     # ------------------------------------------------------------------
     # FIX 2: SPATIAL STACKING (The "Pro" Input Method)
@@ -701,69 +699,14 @@ class DQNAgent:
         return (torch.sigmoid(ml)[0].cpu().numpy() > threshold)
     
     @torch.no_grad()
-    def get_mask_confidence_batch(self, states, buffer_counts):
-        hm_list = []
-        vec_list = []
-        L, W = self.pallet_size
-        
-        for i, state in enumerate(states):
-            hm = state['height_map'] / float(self.max_height)
-            hm_list.append(hm[np.newaxis, :, :])
-            bd = state['box_dims']
-            if np.sum(bd) > 0:
-                bd_norm = [bd[0]/L, bd[1]/W, bd[2]/self.max_height]
-            else:
-                bd_norm = [0, 0, 0]
-            buf_norm = [min(buffer_counts[i], 10) / 10.0]
-            sc = [0.0]*4
-            vec_list.append(bd_norm + buf_norm + sc)
-            
-        hm_t = torch.FloatTensor(np.array(hm_list)).to(self.device)
-        vec_t = torch.FloatTensor(np.array(vec_list)).to(self.device)
+    def get_mask_confidence(self, state, buffer_count=0):
+        """
+        Returns the raw continuous scores (0.0 to 1.0) from the mask head.
+        Used for the 'Maximal Space Passthrough' investigation.
+        """
+        hm_t, vec_t = self._norm(state, buffer_count)
         _, ml = self.model(hm_t, vec_t)
-        return torch.sigmoid(ml).cpu().numpy()
-
-    @torch.no_grad()
-    def get_action_with_prior_batch(self, states, proxy_scores_list, buffer_counts):
-        # Handle epsilon-greedy
-        n = len(states)
-        actions = []
-        
-        hm_list = []
-        vec_list = []
-        L, W = self.pallet_size
-        
-        batch_indices = []
-        for i in range(n):
-            if np.random.rand() <= self.epsilon:
-                actions.append(int(np.random.randint(0, self.action_size)))
-            else:
-                actions.append(None) # Marker for model inference
-                batch_indices.append(i)
-        
-        if len(batch_indices) > 0:
-            for i in batch_indices:
-                state = states[i]
-                hm = state['height_map'] / float(self.max_height)
-                hm_list.append(hm[np.newaxis, :, :])
-                bd = state['box_dims']
-                if np.sum(bd) > 0:
-                    bd_norm = [bd[0]/L, bd[1]/W, bd[2]/self.max_height]
-                else:
-                    bd_norm = [0, 0, 0]
-                buf_norm = [min(buffer_counts[i], 10) / 10.0]
-                sc = proxy_scores_list[i]
-                vec_list.append(bd_norm + buf_norm + sc)
-            
-            hm_t = torch.FloatTensor(np.array(hm_list)).to(self.device)
-            vec_t = torch.FloatTensor(np.array(vec_list)).to(self.device)
-            q, _ = self.model(hm_t, vec_t)
-            batch_actions = torch.argmax(q, dim=1).cpu().numpy()
-            
-            for idx, action in zip(batch_indices, batch_actions):
-                actions[idx] = int(action)
-                
-        return actions
+        return torch.sigmoid(ml)[0].cpu().numpy()
 
     def replay(self):
         if len(self.memory) < self.batch_size:
@@ -815,33 +758,29 @@ class DQNAgent:
         q_cur, mask_logits = self.model(hm_curr, vec_curr)
         q_cur = q_cur.gather(1, torch.LongTensor(actions).to(self.device).unsqueeze(1)).squeeze(1)
         
-        # 2. Next State (Double DQN Logic)
+        # 2. Next State
+        # Need to predict next mask to get next proxy scores
         with torch.no_grad():
-            # Use online model to select best action, Target model to evaluate it.
-            hm_next, vec_next_dummy = prepare_batch(next_states, buffer_counts, None)
-            q_next_online, mask_logits_next = self.model(hm_next, vec_next_dummy)
-            mask_probs_next = torch.sigmoid(mask_logits_next).cpu().numpy()
+             # We pass None for scores first just to get mask
+             hm_next, vec_next_dummy = prepare_batch(next_states, buffer_counts, None)
+             _, mask_logits_next = self.target_model(hm_next, vec_next_dummy)
+             mask_probs_next = torch.sigmoid(mask_logits_next).cpu().numpy()
+             
+             # Compute Next Proxy Scores per sample
+             next_scores_list = []
+             for i in range(len(next_states)):
+                 ns = next_states[i]
+                 sc = proxy_scores_for_heuristics(
+                     ns['height_map'], ns['box_dims'], 
+                     (L, W), self.max_height, 
+                     mask_probs_next[i]
+                 )
+                 next_scores_list.append(sc)
             
-            # Best actions according to Online Model
-            next_actions_online = q_next_online.argmax(dim=1)
-            
-            # Compute Next Proxy Scores per sample
-            next_scores_list = []
-            for i in range(len(next_states)):
-                ns = next_states[i]
-                sc = proxy_scores_for_heuristics(
-                    ns['height_map'], ns['box_dims'], 
-                    (L, W), self.max_height, 
-                    mask_probs_next[i]
-                )
-                next_scores_list.append(sc)
-            
-            # Now fully prepare next inputs
-            hm_next, vec_next = prepare_batch(next_states, buffer_counts, next_scores_list)
-            q_next_target, _ = self.target_model(hm_next, vec_next)
-            
-            # Double DQN evaluation: evaluate next_actions_online with q_next_target
-            q_next = q_next_target.gather(1, next_actions_online.unsqueeze(1)).squeeze(1)
+             # Now fully prepare next inputs
+             hm_next, vec_next = prepare_batch(next_states, buffer_counts, next_scores_list)
+             q_next, _ = self.target_model(hm_next, vec_next)
+             q_next, _ = q_next.max(1)
             
         dones_t = torch.FloatTensor([1.0 if d else 0.0 for d in dones]).to(self.device)
         rewards_t = torch.FloatTensor(rewards).to(self.device)
@@ -867,18 +806,12 @@ class DQNAgent:
         torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
         self.optimizer.step()
         self.optimizer_step_count += 1 
-        self.update_target_model(soft=True)
 
         self.last_q_loss = q_loss.item()
         self.last_mask_loss = mask_loss.item()
 
-    def update_target_model(self, soft=True):
-        if soft:
-            # Polyak Averaging: target = tau * model + (1-tau) * target
-            for target_param, param in zip(self.target_model.parameters(), self.model.parameters()):
-                target_param.data.copy_(self.tau * param.data + (1.0 - self.tau) * target_param.data)
-        else:
-            self.target_model.load_state_dict(self.model.state_dict())
+    def update_target_model(self):
+        self.target_model.load_state_dict(self.model.state_dict())
 
     def save_model(self, path):
         torch.save({
@@ -1065,7 +998,7 @@ def train(
             if action is None:
                 action, mapping = env.choose_action_by_heuristic(heuristic, pred_mask=None)
                 if action is None:
-                    agent.remember(state, h_idx, defer_penalty, state, True, current_buffer_size)
+                    agent.remember(state, h_idx, defer_penalty, state, False, current_buffer_size)
                     agent.replay()
                     
                     # Store step losses

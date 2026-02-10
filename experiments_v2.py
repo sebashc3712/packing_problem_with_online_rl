@@ -6,9 +6,9 @@ import matplotlib.pyplot as plt
 import argparse
 import pickle
 # Import from the OPTIMIZED file now
-from oskp_rl_up_buffer_experiments import train, DQNAgent, BoxPilingEnv, proxy_scores_for_heuristics
-from vec_env import SubprocVecEnv
-from parallel_train import parallel_train_one_epoch
+from oskp_rl_up_buffer_experiments_v2 import train, DQNAgent, BoxPilingEnv, proxy_scores_for_heuristics
+from vec_env_v2 import SubprocVecEnv
+from parallel_train_v2 import parallel_train_one_epoch
 
 # ==========================================
 # Evaluation Utility
@@ -25,7 +25,7 @@ def evaluate(agent, episodes_boxes, env_params):
     env = BoxPilingEnv(**env_args)
     
     total_utilization = 0.0
-    heuristic_map = {0: 'stacking', 1: 'best_fit', 2: 'semi_perfect_fit', 3: 'corner'}
+    heuristic_map = {0: 'stacking', 1: 'best_fit', 2: 'semi_perfect_fit', 3: 'corner', 4: 'complex_fit'}
     heuristic_counts = {k: 0 for k in heuristic_map.values()}
     total_decisions = 0
     total_invalid_learned = 0
@@ -750,7 +750,7 @@ def run_epoch_training(output_dir, train_episodes=10000, val_episodes=None, pati
     env = BoxPilingEnv()
     agent = DQNAgent(
         state_dims={'height_map': env.pallet_size, 'box_dims': 3},
-        action_size=4,
+        action_size=5,
         max_height=env.max_height,
         learning_rate=0.0001,
         min_support_ratio=0.60,
@@ -864,7 +864,7 @@ def run_epoch_training(output_dir, train_episodes=10000, val_episodes=None, pati
 def save_visualizations(agent, episodes_boxes, output_dir, env_params, n_samples=10):
     """Run agent on N samples and save 3D visualizations."""
     import random
-    from oskp_rl_up_buffer_experiments import BoxPilingEnv, proxy_scores_for_heuristics
+    from oskp_rl_up_buffer_experiments_v2 import BoxPilingEnv, proxy_scores_for_heuristics
     
     os.makedirs(output_dir, exist_ok=True)
     samples = random.sample(episodes_boxes, min(n_samples, len(episodes_boxes)))
@@ -875,7 +875,7 @@ def save_visualizations(agent, episodes_boxes, output_dir, env_params, n_samples
     
     env = BoxPilingEnv()
     max_buffer_size = env_params.get('max_buffer_size', 0)
-    heuristic_map = {0: 'stacking', 1: 'best_fit', 2: 'semi_perfect_fit', 3: 'corner'}
+    heuristic_map = {0: 'stacking', 1: 'best_fit', 2: 'semi_perfect_fit', 3: 'corner', 4: 'complex_fit'}
 
     for i, boxes in enumerate(samples):
         state = env.reset()
@@ -1001,7 +1001,7 @@ def train_one_epoch(agent, episodes_boxes, output_dir, env_params):
     q_losses = []
     mask_losses = []
     
-    heuristic_map = {0: 'stacking', 1: 'best_fit', 2: 'semi_perfect_fit', 3: 'corner'}
+    heuristic_map = {0: 'stacking', 1: 'best_fit', 2: 'semi_perfect_fit', 3: 'corner', 4: 'complex_fit'}
     heuristic_counts = {k: 0 for k in heuristic_map.values()}
     total_decisions = 0
     all_metrics = []
@@ -1046,7 +1046,7 @@ def train_one_epoch(agent, episodes_boxes, output_dir, env_params):
             if action is None:
                 action, mapping = env.choose_action_by_heuristic(heuristic, pred_mask=None)
                 if action is None:
-                    agent.remember(state, h_idx, -0.5, state, False, len(buffer), mask_bias)
+                    agent.remember(state, h_idx, -0.5, state, True, len(buffer), mask_bias)
                     agent.replay()
                     if hasattr(agent, 'last_q_loss'): q_losses.append(agent.last_q_loss)
                     if hasattr(agent, 'last_mask_loss'): mask_losses.append(agent.last_mask_loss)
@@ -1136,7 +1136,7 @@ if __name__ == "__main__":
     elif args.exp == 9:
         grid_search(os.path.join(base_output, "exp9_grid_search"), args.episodes, args.val_episodes)
     elif args.exp == 10:
-        run_epoch_training(os.path.join(base_output, "exp10_epoch_training_parallel"), 
+        run_epoch_training(os.path.join(base_output, "exp10_epoch_training_parallel_v2"), 
                            args.episodes, args.val_episodes, args.patience, 
                            args.max_epochs, args.buffer_size, args.num_envs)
     else:

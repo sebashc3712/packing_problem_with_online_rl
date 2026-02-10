@@ -6,9 +6,7 @@ import matplotlib.pyplot as plt
 import argparse
 import pickle
 # Import from the OPTIMIZED file now
-from oskp_rl_up_buffer_experiments import train, DQNAgent, BoxPilingEnv, proxy_scores_for_heuristics
-from vec_env import SubprocVecEnv
-from parallel_train import parallel_train_one_epoch
+from oskp_rl_up_buffer_experiments_v1_sequential import train, DQNAgent, BoxPilingEnv, proxy_scores_for_heuristics
 
 # ==========================================
 # Evaluation Utility
@@ -728,11 +726,11 @@ def grid_search(output_dir, train_episodes=10000, val_episodes=None):
     print(pd.DataFrame(results))
     
 
-def run_epoch_training(output_dir, train_episodes=10000, val_episodes=None, patience=30, max_epochs=20, buffer_size=0, num_envs=8):
-    print(f"\n=== Experiment 10: Epoch-Based Training (Buffer={buffer_size}) ===")
+def run_epoch_training(output_dir, train_episodes=10000, val_episodes=None, patience=30, max_epochs=20, buffer_size=0):
+    print(f"\n=== Experiment 10: Epoch-Based Training (Buffer={buffer_size}, LR=0.0001) ===")
     os.makedirs(output_dir, exist_ok=True)
     
-    # Load Data
+    # Load Data (Keep your existing loading code)
     train_data = load_instances("approachesO3DKP/ga_mixed_large.pt")
     val_cut1 = load_instances("approachesO3DKP/cut_1.pt")
     val_cut2 = load_instances("approachesO3DKP/cut_2.pt")
@@ -743,6 +741,7 @@ def run_epoch_training(output_dir, train_episodes=10000, val_episodes=None, pati
         val_cut2 = val_cut2[:val_episodes]
         val_rs = val_rs[:val_episodes]
     
+    train_subset = list(train_data[:train_episodes]) if train_episodes else list(train_data)
     models_dir = os.path.join(output_dir, "models")
     os.makedirs(models_dir, exist_ok=True)
     
@@ -752,21 +751,22 @@ def run_epoch_training(output_dir, train_episodes=10000, val_episodes=None, pati
         state_dims={'height_map': env.pallet_size, 'box_dims': 3},
         action_size=4,
         max_height=env.max_height,
-        learning_rate=0.0001,
+        learning_rate=0.0001, # Start with 0.0001
         min_support_ratio=0.60,
         require_opposite_edge_support=True,
     )
     
-    # FIX: Set a reasonable Batch Size for the Replay Ratio logic in parallel_train.py
-    # 64 is stable. 256 was too large for the data collection speed of 8 environments.
-    agent.batch_size = 64  
-    
-    # LR Scheduler
+    # FIX 3: Add Learning Rate Scheduler
+    # Reduce LR by factor of 0.5 every 5 epochs
     scheduler = torch.optim.lr_scheduler.StepLR(agent.optimizer, step_size=5, gamma=0.5)
 
+    # FIX 4: Reset Epsilon Logic
+    # Start high, decay per EPISODE but very slowly to last across epochs
     agent.epsilon = 1.0 
-    # Slower decay to ensure exploration lasts through early epochs
-    # Decays to 0.1 after approx 50% of training
+    # Calculate decay to reach 0.1 after 50% of Total Epochs * Episodes
+    # e.g., 20 epochs * 10k episodes = 200k steps. 
+    # We want to explore for at least the first 5-8 epochs.
+    # 0.99995 ^ 50000 approx 0.08
     agent.epsilon_decay = 0.999985 
     
     epoch_results = []
@@ -784,17 +784,19 @@ def run_epoch_training(output_dir, train_episodes=10000, val_episodes=None, pati
         print(f"{'='*50}")
         
         import random
+        # Subsample N episodes from the large dataset (50k) for this epoch
+        # This prevents overheating on the same instances
         train_subset = random.sample(train_data, min(len(train_data), train_episodes))
         random.shuffle(train_subset)
         
         train_out_dir = os.path.join(output_dir, f"epoch_{epoch}")
         os.makedirs(train_out_dir, exist_ok=True)
         
-        # Use parallel training
-        metrics = parallel_train_one_epoch(agent, train_subset, train_out_dir, env_params, n_envs=num_envs)
-        scheduler.step()
+        # Train one epoch
+        metrics = train_one_epoch(agent, train_subset, train_out_dir, env_params)
         
-        print(f"  New Learning Rate: {scheduler.get_last_lr()[0]:.6f}")
+        # Step the scheduler
+        scheduler.step()
         
         # Validate
         print(f"\nValidating Epoch {epoch}...")
@@ -811,9 +813,7 @@ def run_epoch_training(output_dir, train_episodes=10000, val_episodes=None, pati
         print(f"    CUT-1: {s_cut1:.2%}, CUT-2: {s_cut2:.2%}, RS: {s_rs:.2%}")
         print(f"    Avg Util: {avg_util:.2%} | End Eps: {agent.epsilon:.4f}")
         
-        # [Rest of result tracking code remains the same as provided in prompt...]
-        # ...
-        
+        # Tracking data
         result_row = {
             'epoch': epoch,
             'train_util': metrics['avg_util'],
@@ -828,6 +828,7 @@ def run_epoch_training(output_dir, train_episodes=10000, val_episodes=None, pati
             'epsilon': agent.epsilon,
             'lr': current_lr
         }
+        # Add heuristic data
         for k, v in metrics['heuristics'].items(): result_row[f'train_h_{k}'] = v
         for k, v in v_cut1['heuristics'].items(): result_row[f'val_cut1_h_{k}'] = v
         for k, v in v_cut2['heuristics'].items(): result_row[f'val_cut2_h_{k}'] = v
@@ -835,7 +836,7 @@ def run_epoch_training(output_dir, train_episodes=10000, val_episodes=None, pati
         
         epoch_results.append(result_row)
         pd.DataFrame(epoch_results).to_csv(results_csv, index=False)
-
+        
         # Save Visualizations (10 samples per set)
         print(f"Saving visualizations for Epoch {epoch}...")
         vis_epoch_dir = os.path.join(output_dir, "visualizations", f"epoch_{epoch}")
@@ -846,6 +847,7 @@ def run_epoch_training(output_dir, train_episodes=10000, val_episodes=None, pati
         # Plot Progress
         plot_experiment_results(epoch_results, output_dir)
         
+        # Save Best & Early Stopping
         if avg_util >= best_avg_util: 
             best_avg_util = avg_util
             agent.save_model(best_model_path)
@@ -864,7 +866,7 @@ def run_epoch_training(output_dir, train_episodes=10000, val_episodes=None, pati
 def save_visualizations(agent, episodes_boxes, output_dir, env_params, n_samples=10):
     """Run agent on N samples and save 3D visualizations."""
     import random
-    from oskp_rl_up_buffer_experiments import BoxPilingEnv, proxy_scores_for_heuristics
+    from oskp_rl_up_buffer_experiments_v1_sequential import BoxPilingEnv, proxy_scores_for_heuristics
     
     os.makedirs(output_dir, exist_ok=True)
     samples = random.sample(episodes_boxes, min(n_samples, len(episodes_boxes)))
@@ -981,16 +983,11 @@ def plot_experiment_results(results, output_dir):
     plt.savefig(os.path.join(output_dir, 'training_summary_plots.png'))
     plt.close()
 
-def make_env():
-    return BoxPilingEnv()
-
-
-
 def train_one_epoch(agent, episodes_boxes, output_dir, env_params):
     """
     Train the agent for one pass through the dataset using ProNet + Maximal Space Bias.
     """
-    from oskp_rl_up_buffer_experiments import BoxPilingEnv, proxy_scores_for_heuristics
+    from oskp_rl_up_buffer_experiments_v1_sequential import BoxPilingEnv, proxy_scores_for_heuristics
     from tqdm import tqdm
     
     env = BoxPilingEnv()
@@ -1046,7 +1043,7 @@ def train_one_epoch(agent, episodes_boxes, output_dir, env_params):
             if action is None:
                 action, mapping = env.choose_action_by_heuristic(heuristic, pred_mask=None)
                 if action is None:
-                    agent.remember(state, h_idx, -0.5, state, False, len(buffer), mask_bias)
+                    agent.remember(state, h_idx, -0.5, state, True, len(buffer), mask_bias)
                     agent.replay()
                     if hasattr(agent, 'last_q_loss'): q_losses.append(agent.last_q_loss)
                     if hasattr(agent, 'last_mask_loss'): mask_losses.append(agent.last_mask_loss)
@@ -1120,7 +1117,6 @@ if __name__ == "__main__":
     parser.add_argument("--max-epochs", type=int, default=20, help="Maximum number of epochs")
     parser.add_argument("--patience", type=int, default=30, help="Early stopping patience")
     parser.add_argument("--buffer-size", type=int, default=0, help="Buffer size for Experiment 10")
-    parser.add_argument("--num-envs", type=int, default=8, help="Number of parallel environments for training")
     args = parser.parse_args()
     
     base_output = "experiments_results_refactored"
@@ -1136,8 +1132,6 @@ if __name__ == "__main__":
     elif args.exp == 9:
         grid_search(os.path.join(base_output, "exp9_grid_search"), args.episodes, args.val_episodes)
     elif args.exp == 10:
-        run_epoch_training(os.path.join(base_output, "exp10_epoch_training_parallel"), 
-                           args.episodes, args.val_episodes, args.patience, 
-                           args.max_epochs, args.buffer_size, args.num_envs)
+        run_epoch_training(os.path.join(base_output, "exp10_epoch_training"), args.episodes, args.val_episodes, args.patience, args.max_epochs, args.buffer_size)
     else:
         print("Use --exp 5, 6, 7, 8, 9, or 10.")
