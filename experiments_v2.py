@@ -1112,19 +1112,1367 @@ def train_one_epoch(agent, episodes_boxes, output_dir, env_params):
     }
 
 
+# ==========================================
+# Experiment 11: Epoch Training with Buffer Dimensions Input (v3 agent)
+# ==========================================
+
+def evaluate_v3(agent, episodes_boxes, env_params):
+    """Evaluate v3 agent (buffer_boxes instead of buffer_count)."""
+    from oskp_rl_up_buffer_experiments_v3 import BoxPilingEnv as BoxPilingEnvV3
+    from oskp_rl_up_buffer_experiments_v3 import proxy_scores_for_heuristics as proxy_scores_v3
+
+    env_args = env_params.copy()
+    max_buffer_size = env_args.pop('max_buffer_size', float('inf'))
+    env_args.pop('min_support_ratio', None)
+    env_args.pop('require_opposite_edge_support', None)
+
+    env = BoxPilingEnvV3(**env_args)
+
+    total_utilization = 0.0
+    heuristic_map = {0: 'stacking', 1: 'best_fit', 2: 'semi_perfect_fit', 3: 'corner', 4: 'complex_fit'}
+    heuristic_counts = {k: 0 for k in heuristic_map.values()}
+    total_decisions = 0
+    total_invalid_learned = 0
+    total_invalid_attempted = 0
+
+    original_eps = agent.epsilon
+    agent.epsilon = 0.0
+
+    for boxes in episodes_boxes:
+        state = env.reset()
+        done = False
+        box_idx = 0
+        buffer = []
+
+        while not done and box_idx < len(boxes):
+            box_dims = boxes[box_idx]
+            box_idx += 1
+
+            state = env.new_box_arrival(box_dims)
+            pred_mask = agent.predict_mask(state, buffer_boxes=buffer)
+
+            mask_bias = proxy_scores_v3(
+                env.current_height_map, env.current_box,
+                env.pallet_size, env.max_height, pred_mask
+            )
+
+            h_idx = agent.get_action_with_prior(state, mask_bias, buffer_boxes=buffer)
+            heuristic = heuristic_map[h_idx]
+            heuristic_counts[heuristic] += 1
+            total_decisions += 1
+
+            action, _ = env.choose_action_by_heuristic(heuristic, pred_mask=pred_mask)
+            if action is None:
+                 action, _ = env.choose_action_by_heuristic(heuristic, pred_mask=None)
+
+            placed = False
+            if action is not None:
+                next_state, reward, local_done, _ = env.step(action)
+                state = next_state
+                placed = True
+
+            if not placed:
+                if len(buffer) < max_buffer_size:
+                    buffer.append(box_dims)
+                else:
+                    done = True
+                    break
+
+            if env._is_terminal():
+                done = True
+                break
+
+        # Buffer Passes
+        while not done and len(buffer) > 0:
+            made_progress = False
+            new_buffer = []
+            for box_dims in buffer:
+                if not env.can_place_box(box_dims):
+                    if len(new_buffer) < max_buffer_size:
+                        new_buffer.append(box_dims)
+                    continue
+
+                state = env.new_box_arrival(box_dims)
+                pred_mask = agent.predict_mask(state, buffer_boxes=new_buffer)
+                mask_bias = proxy_scores_v3(
+                    env.current_height_map, env.current_box,
+                    env.pallet_size, env.max_height, pred_mask
+                )
+                h_idx = agent.get_action_with_prior(state, mask_bias, buffer_boxes=new_buffer)
+                heuristic = heuristic_map[h_idx]
+                heuristic_counts[heuristic] += 1
+                total_decisions += 1
+
+                action, _ = env.choose_action_by_heuristic(heuristic, pred_mask=pred_mask)
+                if action is None:
+                    action, _ = env.choose_action_by_heuristic(heuristic, pred_mask=None)
+
+                if action is not None:
+                    next_state, reward, local_done, _ = env.step(action)
+                    state = next_state
+                    made_progress = True
+                else:
+                    if len(new_buffer) < max_buffer_size:
+                        new_buffer.append(box_dims)
+                    else:
+                        done = True
+                        break
+
+                if env._is_terminal():
+                    done = True; break
+
+            buffer = new_buffer
+            if not made_progress:
+                break
+
+        total_invalid_learned += env.invalid_actions_learned
+        total_invalid_attempted += env.invalid_actions_attempted
+
+        pallet_volume = env.pallet_size[0] * env.pallet_size[1] * env.max_height
+        placed_volume = sum(b[2] * b[3] * b[4] for b in env.placed_boxes)
+        utilization = placed_volume / pallet_volume if pallet_volume > 0 else 0
+        total_utilization += utilization
+
+    agent.epsilon = original_eps
+
+    avg_util = total_utilization / len(episodes_boxes)
+    h_percs = {k: v / total_decisions if total_decisions > 0 else 0 for k, v in heuristic_counts.items()}
+
+    return {
+        'avg_util': avg_util,
+        'heuristics': h_percs,
+        'invalid_learned': total_invalid_learned,
+        'invalid_attempted': total_invalid_attempted
+    }
+
+
+def save_visualizations_v3(agent, episodes_boxes, output_dir, env_params, n_samples=10):
+    """Run v3 agent on N samples and save 3D visualizations."""
+    import random
+    from oskp_rl_up_buffer_experiments_v3 import BoxPilingEnv as BoxPilingEnvV3
+    from oskp_rl_up_buffer_experiments_v3 import proxy_scores_for_heuristics as proxy_scores_v3
+
+    os.makedirs(output_dir, exist_ok=True)
+    samples = random.sample(episodes_boxes, min(n_samples, len(episodes_boxes)))
+
+    orig_eps = agent.epsilon
+    agent.epsilon = 0.0
+
+    env = BoxPilingEnvV3()
+    max_buffer_size = env_params.get('max_buffer_size', 0)
+    heuristic_map = {0: 'stacking', 1: 'best_fit', 2: 'semi_perfect_fit', 3: 'corner', 4: 'complex_fit'}
+
+    for i, boxes in enumerate(samples):
+        state = env.reset()
+        done = False
+        box_idx = 0
+        buffer = []
+
+        while not done and box_idx < len(boxes):
+            box_dims = boxes[box_idx]
+            box_idx += 1
+            state = env.new_box_arrival(box_dims)
+            pred_mask = agent.predict_mask(state, buffer_boxes=buffer)
+            mask_bias = proxy_scores_v3(
+                env.current_height_map, env.current_box,
+                env.pallet_size, env.max_height, pred_mask
+            )
+            h_idx = agent.get_action_with_prior(state, mask_bias, buffer_boxes=buffer)
+            heuristic = heuristic_map[h_idx]
+            action, _ = env.choose_action_by_heuristic(heuristic, pred_mask=pred_mask)
+            if action is None:
+                action, _ = env.choose_action_by_heuristic(heuristic, pred_mask=None)
+
+            if action is not None:
+                next_state, _, _, _ = env.step(action)
+                state = next_state
+            else:
+                if len(buffer) < max_buffer_size:
+                    buffer.append(box_dims)
+                else:
+                    done = True; break
+            if env._is_terminal():
+                done = True; break
+
+        # Buffer passes
+        while not done and len(buffer) > 0:
+            made_progress = False
+            for box in buffer[:]:
+                state = env.new_box_arrival(box)
+                pred_mask = agent.predict_mask(state, buffer_boxes=buffer)
+                mask_bias = proxy_scores_v3(
+                    env.current_height_map, env.current_box,
+                    env.pallet_size, env.max_height, pred_mask
+                )
+                h_idx = agent.get_action_with_prior(state, mask_bias, buffer_boxes=buffer)
+                action, _ = env.choose_action_by_heuristic(heuristic_map[h_idx], pred_mask=None)
+                if action is not None:
+                    env.step(action); buffer.remove(box); made_progress = True
+            if not made_progress: break
+
+        env.visualize_pallet(
+            episode_num=i+1,
+            boxes_attempted=box_idx,
+            utilization=env.current_height_map.sum() / (env.pallet_size[0] * env.pallet_size[1] * env.max_height),
+            invalid_learned=env.invalid_actions_learned,
+            invalid_attempted=env.invalid_actions_attempted,
+            output_dir=output_dir
+        )
+
+    agent.epsilon = orig_eps
+
+
+def run_epoch_training_v3(output_dir, train_episodes=10000, val_episodes=None, patience=30, max_epochs=20, buffer_size=0, num_envs=8):
+    """Experiment 11: Same as Experiment 10 but using v3 agent with buffer box dimensions input."""
+    from oskp_rl_up_buffer_experiments_v3 import DQNAgent as DQNAgentV3, BoxPilingEnv as BoxPilingEnvV3
+    from parallel_train_v3 import parallel_train_one_epoch as parallel_train_one_epoch_v3
+
+    print(f"\n=== Experiment 11: Epoch-Based Training with Buffer Dims Input (Buffer={buffer_size}) ===")
+    os.makedirs(output_dir, exist_ok=True)
+
+    # Load Data
+    train_data = load_instances("approachesO3DKP/ga_mixed_large.pt")
+    val_cut1 = load_instances("approachesO3DKP/cut_1.pt")
+    val_cut2 = load_instances("approachesO3DKP/cut_2.pt")
+    val_rs = load_instances("approachesO3DKP/rs.pt")
+
+    if val_episodes:
+        val_cut1 = val_cut1[:val_episodes]
+        val_cut2 = val_cut2[:val_episodes]
+        val_rs = val_rs[:val_episodes]
+
+    models_dir = os.path.join(output_dir, "models")
+    os.makedirs(models_dir, exist_ok=True)
+
+    # Init v3 Agent with buffer dimensions
+    env = BoxPilingEnvV3()
+    agent = DQNAgentV3(
+        state_dims={'height_map': env.pallet_size, 'box_dims': 3},
+        action_size=5,
+        max_height=env.max_height,
+        learning_rate=0.0001,
+        max_buffer_slots=max(buffer_size, 1),  # At least 1 slot even if buffer_size=0
+        min_support_ratio=0.60,
+        require_opposite_edge_support=True,
+    )
+
+    agent.batch_size = 64
+
+    # LR Scheduler
+    scheduler = torch.optim.lr_scheduler.StepLR(agent.optimizer, step_size=5, gamma=0.5)
+
+    agent.epsilon = 1.0
+    agent.epsilon_decay = 0.999985
+
+    epoch_results = []
+    best_avg_util = 0.0
+    epochs_without_improvement = 0
+    best_model_path = os.path.join(models_dir, "dqn_best_epoch.pt")
+    results_csv = os.path.join(output_dir, "epoch_training_results.csv")
+
+    env_params = {'max_buffer_size': buffer_size, 'min_support_ratio': 0.60, 'require_opposite_edge_support': True}
+
+    for epoch in range(1, max_epochs + 1):
+        print(f"\n{'='*50}")
+        current_lr = scheduler.get_last_lr()[0]
+        print(f"EPOCH {epoch}/{max_epochs} | LR: {current_lr:.6f} | Start Eps: {agent.epsilon:.4f}")
+        print(f"{'='*50}")
+
+        import random
+        train_subset = random.sample(train_data, min(len(train_data), train_episodes))
+        random.shuffle(train_subset)
+
+        train_out_dir = os.path.join(output_dir, f"epoch_{epoch}")
+        os.makedirs(train_out_dir, exist_ok=True)
+
+        # Use parallel training (v3)
+        metrics = parallel_train_one_epoch_v3(agent, train_subset, train_out_dir, env_params, n_envs=num_envs)
+        scheduler.step()
+
+        print(f"  New Learning Rate: {scheduler.get_last_lr()[0]:.6f}")
+
+        # Validate using v3 evaluate
+        print(f"\nValidating Epoch {epoch}...")
+        v_cut1 = evaluate_v3(agent, val_cut1, env_params)
+        v_cut2 = evaluate_v3(agent, val_cut2, env_params)
+        v_rs = evaluate_v3(agent, val_rs, env_params)
+
+        s_cut1 = v_cut1['avg_util']
+        s_cut2 = v_cut2['avg_util']
+        s_rs = v_rs['avg_util']
+        avg_util = (s_cut1 + s_cut2 + s_rs) / 3
+
+        print(f"  Epoch {epoch} Results:")
+        print(f"    CUT-1: {s_cut1:.2%}, CUT-2: {s_cut2:.2%}, RS: {s_rs:.2%}")
+        print(f"    Avg Util: {avg_util:.2%} | End Eps: {agent.epsilon:.4f}")
+
+        result_row = {
+            'epoch': epoch,
+            'train_util': metrics['avg_util'],
+            'train_q_loss': metrics['avg_q_loss'],
+            'train_mask_loss': metrics['avg_mask_loss'],
+            'val_cut1_util': s_cut1,
+            'val_cut2_util': s_cut2,
+            'val_rs_util': s_rs,
+            'avg_val_util': avg_util,
+            'invalid_learned': metrics['invalid_learned'],
+            'invalid_attempted': metrics['invalid_attempted'],
+            'epsilon': agent.epsilon,
+            'lr': current_lr
+        }
+        for k, v in metrics['heuristics'].items(): result_row[f'train_h_{k}'] = v
+        for k, v in v_cut1['heuristics'].items(): result_row[f'val_cut1_h_{k}'] = v
+        for k, v in v_cut2['heuristics'].items(): result_row[f'val_cut2_h_{k}'] = v
+        for k, v in v_rs['heuristics'].items(): result_row[f'val_rs_h_{k}'] = v
+
+        epoch_results.append(result_row)
+        pd.DataFrame(epoch_results).to_csv(results_csv, index=False)
+
+        # Save Visualizations
+        print(f"Saving visualizations for Epoch {epoch}...")
+        vis_epoch_dir = os.path.join(output_dir, "visualizations", f"epoch_{epoch}")
+        save_visualizations_v3(agent, val_cut1, os.path.join(vis_epoch_dir, "cut1"), env_params, n_samples=10)
+        save_visualizations_v3(agent, val_cut2, os.path.join(vis_epoch_dir, "cut2"), env_params, n_samples=10)
+        save_visualizations_v3(agent, val_rs, os.path.join(vis_epoch_dir, "rs"), env_params, n_samples=10)
+
+        # Plot Progress
+        plot_experiment_results(epoch_results, output_dir)
+
+        if avg_util >= best_avg_util:
+            best_avg_util = avg_util
+            agent.save_model(best_model_path)
+            epochs_without_improvement = 0
+            print(f"  * New best model saved!")
+        else:
+            epochs_without_improvement += 1
+            print(f"  No significant improvement ({epochs_without_improvement}/{patience})")
+
+        if epochs_without_improvement >= patience:
+            print("Early Stopping Reached.")
+            break
+
+    return epoch_results
+
+
+# ==========================================
+# Experiment 12: Buffer-as-Action (v4 agent)
+# ==========================================
+
+def evaluate_v4(agent, episodes_boxes, env_params):
+    """Evaluate v4 agent (6 actions: 5 heuristics + buffer defer)."""
+    from oskp_rl_up_buffer_experiments_v4 import BoxPilingEnv as BoxPilingEnvV4
+    from oskp_rl_up_buffer_experiments_v4 import proxy_scores_for_heuristics as proxy_scores_v4
+
+    env_args = env_params.copy()
+    max_buffer_size = env_args.pop('max_buffer_size', float('inf'))
+    env_args.pop('min_support_ratio', None)
+    env_args.pop('require_opposite_edge_support', None)
+
+    env = BoxPilingEnvV4(**env_args)
+
+    total_utilization = 0.0
+    heuristic_map = {0: 'stacking', 1: 'best_fit', 2: 'semi_perfect_fit', 3: 'corner', 4: 'complex_fit', 5: 'BUFFER'}
+    heuristic_counts = {k: 0 for k in heuristic_map.values()}
+    total_decisions = 0
+    total_invalid_learned = 0
+    total_invalid_attempted = 0
+    buffer_defer_count = 0
+    buffer_place_after_count = 0
+
+    original_eps = agent.epsilon
+    agent.epsilon = 0.0
+
+    for boxes in episodes_boxes:
+        state = env.reset()
+        done = False
+        box_idx = 0
+        buffer = []
+
+        while not done and box_idx < len(boxes):
+            box_dims = boxes[box_idx]
+            box_idx += 1
+
+            state = env.new_box_arrival(box_dims)
+            # Use continuous mask probs for proxy scores (like training does)
+            mask_probs = agent.get_mask_confidence_batch([state], [buffer])[0]
+            pred_mask = mask_probs > 0.5  # Binary mask for heuristic filtering
+
+            mask_bias = proxy_scores_v4(
+                env.current_height_map, env.current_box,
+                env.pallet_size, env.max_height, mask_probs,
+                buffer_boxes=buffer, max_buffer_slots=max_buffer_size
+            )
+
+            h_idx = agent.get_action_with_prior(state, mask_bias, buffer_boxes=buffer)
+            heuristic_counts[heuristic_map[h_idx]] += 1
+            total_decisions += 1
+
+            if h_idx == 5:
+                # Buffer defer action
+                buffer_defer_count += 1
+                if len(buffer) < max_buffer_size:
+                    buffer.append(box_dims)
+                else:
+                    done = True
+                    break
+            else:
+                heuristic = heuristic_map[h_idx]
+                action, _ = env.choose_action_by_heuristic(heuristic, pred_mask=pred_mask)
+                if action is None:
+                    action, _ = env.choose_action_by_heuristic(heuristic, pred_mask=None)
+
+                placed = False
+                if action is not None:
+                    free_buf = max_buffer_size - len(buffer)
+                    next_state, reward, local_done, _ = env.step(action, free_buffer_slots=free_buf, max_buffer_slots=max_buffer_size)
+                    state = next_state
+                    placed = True
+
+                if not placed:
+                    if len(buffer) < max_buffer_size:
+                        buffer.append(box_dims)
+                    else:
+                        done = True
+                        break
+
+                # Post-placement buffer check
+                if placed and len(buffer) > 0:
+                    buf_checks = 0
+                    while buf_checks < max_buffer_size and len(buffer) > 0:
+                        buf_checks += 1
+                        buf_box = buffer[0]
+
+                        if not env.can_place_box(buf_box):
+                            break
+
+                        state = env.new_box_arrival(buf_box)
+                        buf_mask_probs = agent.get_mask_confidence_batch([state], [buffer[1:]])[0]
+                        buf_pred_mask = buf_mask_probs > 0.5
+                        buf_mask_bias = proxy_scores_v4(
+                            env.current_height_map, env.current_box,
+                            env.pallet_size, env.max_height, buf_mask_probs,
+                            buffer_boxes=buffer[1:], max_buffer_slots=max_buffer_size
+                        )
+                        buf_h_idx = agent.get_action_with_prior(state, buf_mask_bias, buffer_boxes=buffer[1:])
+
+                        if buf_h_idx == 5:
+                            break
+
+                        buf_heuristic = heuristic_map[buf_h_idx]
+                        heuristic_counts[heuristic_map[buf_h_idx]] += 1
+                        total_decisions += 1
+
+                        buf_action, _ = env.choose_action_by_heuristic(buf_heuristic, pred_mask=buf_pred_mask)
+                        if buf_action is None:
+                            buf_action, _ = env.choose_action_by_heuristic(buf_heuristic, pred_mask=None)
+
+                        if buf_action is not None:
+                            free_buf_now = max_buffer_size - len(buffer) + 1
+                            next_state, _, local_done, _ = env.step(buf_action, free_buffer_slots=free_buf_now, max_buffer_slots=max_buffer_size)
+                            state = next_state
+                            buffer.pop(0)
+                            buffer_place_after_count += 1
+                            if local_done:
+                                done = True
+                                break
+                        else:
+                            break
+
+            if env._is_terminal():
+                done = True
+                break
+
+        # --- Buffer Passes ---
+        while not done and len(buffer) > 0:
+            made_progress = False
+            new_buffer = []
+            for box_dims in buffer:
+                if not env.can_place_box(box_dims):
+                    if len(new_buffer) < max_buffer_size:
+                        new_buffer.append(box_dims)
+                    continue
+
+                state = env.new_box_arrival(box_dims)
+                mask_probs = agent.get_mask_confidence_batch([state], [new_buffer])[0]
+                pred_mask = mask_probs > 0.5
+                mask_bias = proxy_scores_v4(
+                    env.current_height_map, env.current_box,
+                    env.pallet_size, env.max_height, mask_probs,
+                    buffer_boxes=new_buffer, max_buffer_slots=max_buffer_size
+                )
+                h_idx = agent.get_action_with_prior(state, mask_bias, buffer_boxes=new_buffer)
+
+                if h_idx == 5:
+                    # Re-buffer
+                    if len(new_buffer) < max_buffer_size:
+                        new_buffer.append(box_dims)
+                    continue
+
+                heuristic = heuristic_map[h_idx]
+                heuristic_counts[heuristic_map[h_idx]] += 1
+                total_decisions += 1
+
+                action, _ = env.choose_action_by_heuristic(heuristic, pred_mask=pred_mask)
+                if action is None:
+                    action, _ = env.choose_action_by_heuristic(heuristic, pred_mask=None)
+
+                if action is not None:
+                    free_buf_now = max_buffer_size - len(new_buffer)
+                    next_state, reward, local_done, _ = env.step(action, free_buffer_slots=free_buf_now, max_buffer_slots=max_buffer_size)
+                    state = next_state
+                    made_progress = True
+                else:
+                    if len(new_buffer) < max_buffer_size:
+                        new_buffer.append(box_dims)
+                    else:
+                        done = True
+                        break
+
+                if env._is_terminal():
+                    done = True; break
+
+            buffer = new_buffer
+            if not made_progress:
+                break
+
+        total_invalid_learned += env.invalid_actions_learned
+        total_invalid_attempted += env.invalid_actions_attempted
+
+        pallet_volume = env.pallet_size[0] * env.pallet_size[1] * env.max_height
+        placed_volume = sum(b[2] * b[3] * b[4] for b in env.placed_boxes)
+        utilization = placed_volume / pallet_volume if pallet_volume > 0 else 0
+        total_utilization += utilization
+
+    agent.epsilon = original_eps
+
+    avg_util = total_utilization / len(episodes_boxes)
+    h_percs = {k: v / total_decisions if total_decisions > 0 else 0 for k, v in heuristic_counts.items()}
+
+    return {
+        'avg_util': avg_util,
+        'heuristics': h_percs,
+        'invalid_learned': total_invalid_learned,
+        'invalid_attempted': total_invalid_attempted,
+        'buffer_defer_count': buffer_defer_count,
+        'buffer_place_after_count': buffer_place_after_count
+    }
+
+
+def save_visualizations_v4(agent, episodes_boxes, output_dir, env_params, n_samples=10):
+    """Run v4 agent on N samples and save 3D visualizations."""
+    import random
+    from oskp_rl_up_buffer_experiments_v4 import BoxPilingEnv as BoxPilingEnvV4
+    from oskp_rl_up_buffer_experiments_v4 import proxy_scores_for_heuristics as proxy_scores_v4
+
+    os.makedirs(output_dir, exist_ok=True)
+    samples = random.sample(episodes_boxes, min(n_samples, len(episodes_boxes)))
+
+    orig_eps = agent.epsilon
+    agent.epsilon = 0.0
+
+    env = BoxPilingEnvV4()
+    max_buffer_size = env_params.get('max_buffer_size', 0)
+    heuristic_map = {0: 'stacking', 1: 'best_fit', 2: 'semi_perfect_fit', 3: 'corner', 4: 'complex_fit', 5: 'BUFFER'}
+
+    for i, boxes in enumerate(samples):
+        state = env.reset()
+        done = False
+        box_idx = 0
+        buffer = []
+
+        while not done and box_idx < len(boxes):
+            box_dims = boxes[box_idx]
+            box_idx += 1
+            state = env.new_box_arrival(box_dims)
+            mask_probs = agent.get_mask_confidence_batch([state], [buffer])[0]
+            pred_mask = mask_probs > 0.5
+            mask_bias = proxy_scores_v4(
+                env.current_height_map, env.current_box,
+                env.pallet_size, env.max_height, mask_probs,
+                buffer_boxes=buffer, max_buffer_slots=max_buffer_size
+            )
+            h_idx = agent.get_action_with_prior(state, mask_bias, buffer_boxes=buffer)
+
+            if h_idx == 5:
+                if len(buffer) < max_buffer_size:
+                    buffer.append(box_dims)
+                else:
+                    done = True; break
+            else:
+                heuristic = heuristic_map[h_idx]
+                action, _ = env.choose_action_by_heuristic(heuristic, pred_mask=pred_mask)
+                if action is None:
+                    action, _ = env.choose_action_by_heuristic(heuristic, pred_mask=None)
+
+                if action is not None:
+                    free_buf = max_buffer_size - len(buffer)
+                    next_state, _, _, _ = env.step(action, free_buffer_slots=free_buf, max_buffer_slots=max_buffer_size)
+                    state = next_state
+
+                    # Post-placement buffer check
+                    buf_checks = 0
+                    while buf_checks < max_buffer_size and len(buffer) > 0:
+                        buf_checks += 1
+                        buf_box = buffer[0]
+                        if not env.can_place_box(buf_box):
+                            break
+                        state = env.new_box_arrival(buf_box)
+                        buf_mask_probs = agent.get_mask_confidence_batch([state], [buffer[1:]])[0]
+                        buf_pred_mask = buf_mask_probs > 0.5
+                        buf_mask_bias = proxy_scores_v4(
+                            env.current_height_map, env.current_box,
+                            env.pallet_size, env.max_height, buf_mask_probs,
+                            buffer_boxes=buffer[1:], max_buffer_slots=max_buffer_size
+                        )
+                        buf_h_idx = agent.get_action_with_prior(state, buf_mask_bias, buffer_boxes=buffer[1:])
+                        if buf_h_idx == 5:
+                            break
+                        buf_action, _ = env.choose_action_by_heuristic(heuristic_map[buf_h_idx], pred_mask=None)
+                        if buf_action is not None:
+                            env.step(buf_action); buffer.pop(0)
+                        else:
+                            break
+                else:
+                    if len(buffer) < max_buffer_size:
+                        buffer.append(box_dims)
+                    else:
+                        done = True; break
+
+            if env._is_terminal():
+                done = True; break
+
+        # Buffer passes
+        while not done and len(buffer) > 0:
+            made_progress = False
+            for box in buffer[:]:
+                state = env.new_box_arrival(box)
+                mask_probs = agent.get_mask_confidence_batch([state], [buffer])[0]
+                mask_bias = proxy_scores_v4(
+                    env.current_height_map, env.current_box,
+                    env.pallet_size, env.max_height, mask_probs,
+                    buffer_boxes=buffer, max_buffer_slots=max_buffer_size
+                )
+                h_idx = agent.get_action_with_prior(state, mask_bias, buffer_boxes=buffer)
+                if h_idx == 5:
+                    continue
+                action, _ = env.choose_action_by_heuristic(heuristic_map[h_idx], pred_mask=None)
+                if action is not None:
+                    env.step(action); buffer.remove(box); made_progress = True
+            if not made_progress: break
+
+        env.visualize_pallet(
+            episode_num=i+1,
+            boxes_attempted=box_idx,
+            utilization=env.current_height_map.sum() / (env.pallet_size[0] * env.pallet_size[1] * env.max_height),
+            invalid_learned=env.invalid_actions_learned,
+            invalid_attempted=env.invalid_actions_attempted,
+            output_dir=output_dir
+        )
+
+    agent.epsilon = orig_eps
+
+
+def run_epoch_training_v4(output_dir, train_episodes=10000, val_episodes=None, patience=30, max_epochs=20, buffer_size=0, num_envs=8):
+    """Experiment 12: Buffer-as-Action using v4 agent (6 actions)."""
+    from oskp_rl_up_buffer_experiments_v4 import DQNAgent as DQNAgentV4, BoxPilingEnv as BoxPilingEnvV4
+    from parallel_train_v4 import parallel_train_one_epoch as parallel_train_one_epoch_v4
+
+    print(f"\n=== Experiment 12: Buffer-as-Action Training (Buffer={buffer_size}) ===")
+    os.makedirs(output_dir, exist_ok=True)
+
+    # Load Data
+    train_data = load_instances("approachesO3DKP/ga_mixed_large.pt")
+    val_cut1 = load_instances("approachesO3DKP/cut_1.pt")
+    val_cut2 = load_instances("approachesO3DKP/cut_2.pt")
+    val_rs = load_instances("approachesO3DKP/rs.pt")
+
+    if val_episodes:
+        val_cut1 = val_cut1[:val_episodes]
+        val_cut2 = val_cut2[:val_episodes]
+        val_rs = val_rs[:val_episodes]
+
+    models_dir = os.path.join(output_dir, "models")
+    os.makedirs(models_dir, exist_ok=True)
+
+    # Init v4 Agent
+    env = BoxPilingEnvV4()
+    agent = DQNAgentV4(
+        state_dims={'height_map': env.pallet_size, 'box_dims': 3},
+        action_size=6,
+        max_height=env.max_height,
+        learning_rate=0.0001,
+        max_buffer_slots=max(buffer_size, 1),
+    )
+
+    agent.batch_size = 64
+
+    # LR Scheduler
+    scheduler = torch.optim.lr_scheduler.StepLR(agent.optimizer, step_size=5, gamma=0.5)
+
+    agent.epsilon = 1.0
+    agent.epsilon_decay = 0.999980  # Slower decay for 6-action exploration
+
+    epoch_results = []
+    best_avg_util = 0.0
+    epochs_without_improvement = 0
+    best_model_path = os.path.join(models_dir, "dqn_best_epoch.pt")
+    results_csv = os.path.join(output_dir, "epoch_training_results.csv")
+
+    env_params = {'max_buffer_size': buffer_size, 'min_support_ratio': 0.60, 'require_opposite_edge_support': True}
+
+    for epoch in range(1, max_epochs + 1):
+        print(f"\n{'='*50}")
+        current_lr = scheduler.get_last_lr()[0]
+        print(f"EPOCH {epoch}/{max_epochs} | LR: {current_lr:.6f} | Start Eps: {agent.epsilon:.4f}")
+        print(f"{'='*50}")
+
+        import random
+        train_subset = random.sample(train_data, min(len(train_data), train_episodes))
+        random.shuffle(train_subset)
+
+        train_out_dir = os.path.join(output_dir, f"epoch_{epoch}")
+        os.makedirs(train_out_dir, exist_ok=True)
+
+        # Use parallel training (v4)
+        metrics = parallel_train_one_epoch_v4(agent, train_subset, train_out_dir, env_params, n_envs=num_envs)
+        scheduler.step()
+
+        print(f"  New Learning Rate: {scheduler.get_last_lr()[0]:.6f}")
+        print(f"  Buffer Defers: {metrics['buffer_defer_count']} | Buffer Place-After: {metrics['buffer_place_after_count']}")
+
+        # Validate using v4 evaluate
+        print(f"\nValidating Epoch {epoch}...")
+        v_cut1 = evaluate_v4(agent, val_cut1, env_params)
+        v_cut2 = evaluate_v4(agent, val_cut2, env_params)
+        v_rs = evaluate_v4(agent, val_rs, env_params)
+
+        s_cut1 = v_cut1['avg_util']
+        s_cut2 = v_cut2['avg_util']
+        s_rs = v_rs['avg_util']
+        avg_util = (s_cut1 + s_cut2 + s_rs) / 3
+
+        print(f"  Epoch {epoch} Results:")
+        print(f"    CUT-1: {s_cut1:.2%}, CUT-2: {s_cut2:.2%}, RS: {s_rs:.2%}")
+        print(f"    Avg Util: {avg_util:.2%} | End Eps: {agent.epsilon:.4f}")
+        print(f"    Val Buffer Defers: cut1={v_cut1['buffer_defer_count']}, cut2={v_cut2['buffer_defer_count']}, rs={v_rs['buffer_defer_count']}")
+
+        result_row = {
+            'epoch': epoch,
+            'train_util': metrics['avg_util'],
+            'train_q_loss': metrics['avg_q_loss'],
+            'train_mask_loss': metrics['avg_mask_loss'],
+            'val_cut1_util': s_cut1,
+            'val_cut2_util': s_cut2,
+            'val_rs_util': s_rs,
+            'avg_val_util': avg_util,
+            'invalid_learned': metrics['invalid_learned'],
+            'invalid_attempted': metrics['invalid_attempted'],
+            'epsilon': agent.epsilon,
+            'lr': current_lr,
+            'buffer_defer_count': metrics['buffer_defer_count'],
+            'buffer_place_after_count': metrics['buffer_place_after_count'],
+        }
+        for k, v in metrics['heuristics'].items(): result_row[f'train_h_{k}'] = v
+        for k, v in v_cut1['heuristics'].items(): result_row[f'val_cut1_h_{k}'] = v
+        for k, v in v_cut2['heuristics'].items(): result_row[f'val_cut2_h_{k}'] = v
+        for k, v in v_rs['heuristics'].items(): result_row[f'val_rs_h_{k}'] = v
+
+        epoch_results.append(result_row)
+        pd.DataFrame(epoch_results).to_csv(results_csv, index=False)
+
+        # Save Visualizations
+        print(f"Saving visualizations for Epoch {epoch}...")
+        vis_epoch_dir = os.path.join(output_dir, "visualizations", f"epoch_{epoch}")
+        save_visualizations_v4(agent, val_cut1, os.path.join(vis_epoch_dir, "cut1"), env_params, n_samples=10)
+        save_visualizations_v4(agent, val_cut2, os.path.join(vis_epoch_dir, "cut2"), env_params, n_samples=10)
+        save_visualizations_v4(agent, val_rs, os.path.join(vis_epoch_dir, "rs"), env_params, n_samples=10)
+
+        # Plot Progress
+        plot_experiment_results(epoch_results, output_dir)
+
+        if avg_util >= best_avg_util:
+            best_avg_util = avg_util
+            agent.save_model(best_model_path)
+            epochs_without_improvement = 0
+            print(f"  * New best model saved!")
+        else:
+            epochs_without_improvement += 1
+            print(f"  No significant improvement ({epochs_without_improvement}/{patience})")
+
+        if epochs_without_improvement >= patience:
+            print("Early Stopping Reached.")
+            break
+
+    return epoch_results
+
+
+# =====================================================
+# V5 Functions: Improved Buffer-as-Action (Exp 13)
+# =====================================================
+
+def _make_env_v5():
+    from oskp_rl_up_buffer_experiments_v5 import BoxPilingEnv
+    return BoxPilingEnv()
+
+
+def evaluate_v5(agent, episodes_boxes, env_params, n_envs=4):
+    """Evaluate v5 agent using multiprocessing (6 actions: 5 heuristics + improved buffer defer)."""
+    from vec_env_v5 import SubprocVecEnv
+
+    max_buffer_size = env_params.get('max_buffer_size', 0)
+    heuristic_map = {0: 'stacking', 1: 'best_fit', 2: 'semi_perfect_fit', 3: 'corner', 4: 'complex_fit', 5: 'BUFFER'}
+    heuristic_counts = {k: 0 for k in heuristic_map.values()}
+    total_decisions = 0
+    total_utilization = 0.0
+    total_invalid_learned = 0
+    total_invalid_attempted = 0
+    buffer_defer_count = 0
+    buffer_place_after_count = 0
+
+    original_eps = agent.epsilon
+    agent.epsilon = 0.0
+
+    n_episodes = len(episodes_boxes)
+    n_envs = min(n_envs, n_episodes)
+    envs = SubprocVecEnv([_make_env_v5 for _ in range(n_envs)])
+    envs.reset()
+
+    # State tracking per slot
+    active_ep_indices = list(range(n_envs))
+    next_ep_idx = n_envs
+    slot_boxes_ptr = [0] * n_envs
+    slot_buffers = [[] for _ in range(n_envs)]
+    slot_phases = ['STREAM'] * n_envs
+    slot_done = [False] * n_envs
+    slot_states = [None] * n_envs
+    slot_buffer_tried_count = [0] * n_envs
+
+    while any(d is False for d in slot_done) or next_ep_idx < n_episodes:
+        step_envs_indices = []
+        step_box_dims_list = []
+
+        for i in range(n_envs):
+            if slot_done[i] is not False: continue
+
+            if slot_phases[i] == 'STREAM':
+                boxes = episodes_boxes[active_ep_indices[i]]
+                if slot_boxes_ptr[i] < len(boxes):
+                    box_dims = boxes[slot_boxes_ptr[i]]
+                    slot_boxes_ptr[i] += 1
+                    step_envs_indices.append(i)
+                    step_box_dims_list.append(box_dims)
+                    continue
+                else:
+                    slot_phases[i] = 'BUFFER_PASS'
+                    slot_buffer_tried_count[i] = 0
+
+            if slot_phases[i] == 'BUFFER_PASS':
+                if len(slot_buffers[i]) > 0:
+                    if slot_buffer_tried_count[i] >= len(slot_buffers[i]):
+                        slot_done[i] = True
+                        continue
+                    box_dims = slot_buffers[i].pop(0)
+                    step_envs_indices.append(i)
+                    step_box_dims_list.append(box_dims)
+                else:
+                    slot_done[i] = True
+
+        if not step_envs_indices and next_ep_idx >= n_episodes:
+            if all(d is not False for d in slot_done): break
+            continue
+        if not step_envs_indices:
+            break
+
+        # New box arrival
+        for idx, slot_idx in enumerate(step_envs_indices):
+            envs.remotes[slot_idx].send(('new_box_arrival', step_box_dims_list[idx]))
+
+        step_states = []
+        for slot_idx in step_envs_indices:
+            s = envs.remotes[slot_idx].recv()
+            slot_states[slot_idx] = s
+            step_states.append(s)
+
+        # Mask confidence & proxy scores
+        step_buffer_boxes = [list(slot_buffers[i]) for i in step_envs_indices]
+        mask_probs_batch = agent.get_mask_confidence_batch(step_states, step_buffer_boxes)
+
+        for idx, slot_idx in enumerate(step_envs_indices):
+            envs.remotes[slot_idx].send(('get_proxy_scores', (mask_probs_batch[idx], step_buffer_boxes[idx], max_buffer_size)))
+
+        step_proxy_scores = []
+        for slot_idx in step_envs_indices:
+            step_proxy_scores.append(envs.remotes[slot_idx].recv())
+
+        # Greedy action selection
+        h_indices = agent.get_action_with_prior_batch(step_states, step_proxy_scores, step_buffer_boxes)
+        for h_idx in h_indices:
+            heuristic_counts[heuristic_map[h_idx]] += 1
+            total_decisions += 1
+
+        # Execute actions
+        step_actions = []
+        for idx, slot_idx in enumerate(step_envs_indices):
+            if h_indices[idx] == 5:
+                step_actions.append(None)
+            else:
+                heuristic = heuristic_map[h_indices[idx]]
+                pred_mask_bool = mask_probs_batch[idx] > 0.5
+                envs.remotes[slot_idx].send(('choose_action_by_heuristic', (heuristic, pred_mask_bool)))
+                step_actions.append('PENDING')
+
+        for idx, slot_idx in enumerate(step_envs_indices):
+            if step_actions[idx] == 'PENDING':
+                action, _ = envs.remotes[slot_idx].recv()
+                if action is None:
+                    heuristic = heuristic_map[h_indices[idx]]
+                    envs.remotes[slot_idx].send(('choose_action_by_heuristic', (heuristic, None)))
+                    action, _ = envs.remotes[slot_idx].recv()
+                step_actions[idx] = action
+
+        # Step processing
+        for idx, slot_idx in enumerate(step_envs_indices):
+            action = step_actions[idx]
+            h_idx = h_indices[idx]
+            box_dims = step_box_dims_list[idx]
+
+            if h_idx == 5:
+                buffer_defer_count += 1
+                if len(slot_buffers[slot_idx]) < max_buffer_size:
+                    slot_buffers[slot_idx].append(box_dims)
+                else:
+                    slot_done[slot_idx] = True
+
+                if slot_phases[slot_idx] == 'BUFFER_PASS':
+                    slot_buffer_tried_count[slot_idx] = len(slot_buffers[slot_idx])
+
+            elif action is None:
+                if len(slot_buffers[slot_idx]) < max_buffer_size:
+                    slot_buffers[slot_idx].append(box_dims)
+                else:
+                    slot_done[slot_idx] = True
+                if slot_phases[slot_idx] == 'BUFFER_PASS':
+                    slot_buffer_tried_count[slot_idx] += 1
+            else:
+                free_buf = max_buffer_size - len(slot_buffers[slot_idx])
+                envs.remotes[slot_idx].send(('step', (action, free_buf, max_buffer_size)))
+                next_state, reward, local_done, info = envs.remotes[slot_idx].recv()
+
+                if slot_phases[slot_idx] == 'BUFFER_PASS':
+                    slot_buffer_tried_count[slot_idx] = 0
+                if local_done:
+                    slot_done[slot_idx] = True
+
+                # Post-placement buffer check (STREAM phase)
+                if slot_phases[slot_idx] == 'STREAM' and len(slot_buffers[slot_idx]) > 0 and not slot_done[slot_idx]:
+                    buf_check_attempts = 0
+                    while buf_check_attempts < max_buffer_size and len(slot_buffers[slot_idx]) > 0:
+                        buf_check_attempts += 1
+                        buf_box = slot_buffers[slot_idx][0]
+
+                        envs.remotes[slot_idx].send(('can_place_box', buf_box))
+                        if not envs.remotes[slot_idx].recv():
+                            break
+
+                        envs.remotes[slot_idx].send(('new_box_arrival', buf_box))
+                        buf_state = envs.remotes[slot_idx].recv()
+                        buf_buffer_boxes = list(slot_buffers[slot_idx][1:])
+
+                        buf_mask_probs = agent.get_mask_confidence_batch([buf_state], [buf_buffer_boxes])
+                        envs.remotes[slot_idx].send(('get_proxy_scores', (buf_mask_probs[0], buf_buffer_boxes, max_buffer_size)))
+                        buf_proxy_scores = envs.remotes[slot_idx].recv()
+
+                        buf_h_idx = agent.get_action_with_prior(buf_state, buf_proxy_scores, buffer_boxes=buf_buffer_boxes)
+
+                        if buf_h_idx == 5:
+                            break
+
+                        heuristic = heuristic_map[buf_h_idx]
+                        buf_pred_mask_bool = buf_mask_probs[0] > 0.5
+                        envs.remotes[slot_idx].send(('choose_action_by_heuristic', (heuristic, buf_pred_mask_bool)))
+                        buf_action, _ = envs.remotes[slot_idx].recv()
+
+                        if buf_action is None:
+                            envs.remotes[slot_idx].send(('choose_action_by_heuristic', (heuristic, None)))
+                            buf_action, _ = envs.remotes[slot_idx].recv()
+
+                        if buf_action is not None:
+                            free_buf_now = max_buffer_size - len(slot_buffers[slot_idx]) + 1
+                            envs.remotes[slot_idx].send(('step', (buf_action, free_buf_now, max_buffer_size)))
+                            buf_next_state, buf_reward, buf_done, _ = envs.remotes[slot_idx].recv()
+
+                            slot_buffers[slot_idx].pop(0)
+                            buffer_place_after_count += 1
+                            heuristic_counts[heuristic_map[buf_h_idx]] += 1
+                            total_decisions += 1
+
+                            if buf_done:
+                                slot_done[slot_idx] = True
+                                break
+                        else:
+                            break
+
+        # Episode completions
+        for i in range(n_envs):
+            if slot_done[i] is True:
+                envs.remotes[i].send(('get_env_info', {'full': True}))
+                info = envs.remotes[i].recv()
+                total_invalid_learned += info['invalid_learned']
+                total_invalid_attempted += info['invalid_attempted']
+
+                pallet_vol = 10 * 10 * 10  # default pallet
+                if info['placed_boxes']:
+                    placed_vol = sum(b[2] * b[3] * b[4] for b in info['placed_boxes'])
+                    total_utilization += placed_vol / pallet_vol
+
+                if next_ep_idx < n_episodes:
+                    active_ep_indices[i] = next_ep_idx
+                    next_ep_idx += 1
+                    envs.remotes[i].send(('reset', None))
+                    envs.remotes[i].recv()
+                    slot_boxes_ptr[i] = 0
+                    slot_buffers[i] = []
+                    slot_phases[i] = 'STREAM'
+                    slot_done[i] = False
+                else:
+                    slot_done[i] = None
+
+    envs.close()
+    agent.epsilon = original_eps
+
+    avg_util = total_utilization / n_episodes if n_episodes > 0 else 0
+    h_percs = {k: v / total_decisions if total_decisions > 0 else 0 for k, v in heuristic_counts.items()}
+
+    return {
+        'avg_util': avg_util,
+        'heuristics': h_percs,
+        'invalid_learned': total_invalid_learned,
+        'invalid_attempted': total_invalid_attempted,
+        'buffer_defer_count': buffer_defer_count,
+        'buffer_place_after_count': buffer_place_after_count
+    }
+
+
+def save_visualizations_v5(agent, episodes_boxes, output_dir, env_params, n_samples=10):
+    """Run v5 agent on N samples using multiprocessing and save 3D visualizations."""
+    import random
+    from vec_env_v5 import SubprocVecEnv
+    import matplotlib.pyplot as plt
+
+    os.makedirs(output_dir, exist_ok=True)
+    samples = random.sample(episodes_boxes, min(n_samples, len(episodes_boxes)))
+
+    orig_eps = agent.epsilon
+    agent.epsilon = 0.0
+
+    max_buffer_size = env_params.get('max_buffer_size', 0)
+    heuristic_map = {0: 'stacking', 1: 'best_fit', 2: 'semi_perfect_fit', 3: 'corner', 4: 'complex_fit', 5: 'BUFFER'}
+
+    # Process one sample at a time using a single worker (need placed_boxes for visualization)
+    envs = SubprocVecEnv([_make_env_v5])
+
+    for i, boxes in enumerate(samples):
+        envs.remotes[0].send(('reset', None))
+        envs.remotes[0].recv()
+        done = False
+        box_idx = 0
+        buffer = []
+
+        while not done and box_idx < len(boxes):
+            box_dims = boxes[box_idx]
+            box_idx += 1
+
+            envs.remotes[0].send(('new_box_arrival', box_dims))
+            state = envs.remotes[0].recv()
+
+            mask_probs = agent.get_mask_confidence_batch([state], [buffer])[0]
+            pred_mask = mask_probs > 0.5
+
+            envs.remotes[0].send(('get_proxy_scores', (mask_probs, buffer, max_buffer_size)))
+            mask_bias = envs.remotes[0].recv()
+
+            h_idx = agent.get_action_with_prior(state, mask_bias, buffer_boxes=buffer)
+
+            if h_idx == 5:
+                if len(buffer) < max_buffer_size:
+                    buffer.append(box_dims)
+                else:
+                    done = True; break
+            else:
+                heuristic = heuristic_map[h_idx]
+                envs.remotes[0].send(('choose_action_by_heuristic', (heuristic, pred_mask)))
+                action, _ = envs.remotes[0].recv()
+                if action is None:
+                    envs.remotes[0].send(('choose_action_by_heuristic', (heuristic, None)))
+                    action, _ = envs.remotes[0].recv()
+
+                if action is not None:
+                    free_buf = max_buffer_size - len(buffer)
+                    envs.remotes[0].send(('step', (action, free_buf, max_buffer_size)))
+                    next_state, _, local_done, _ = envs.remotes[0].recv()
+                    state = next_state
+
+                    # Post-placement buffer check
+                    buf_checks = 0
+                    while buf_checks < max_buffer_size and len(buffer) > 0:
+                        buf_checks += 1
+                        buf_box = buffer[0]
+
+                        envs.remotes[0].send(('can_place_box', buf_box))
+                        if not envs.remotes[0].recv():
+                            break
+
+                        envs.remotes[0].send(('new_box_arrival', buf_box))
+                        buf_state = envs.remotes[0].recv()
+                        buf_buffer_boxes = list(buffer[1:])
+                        buf_mask_probs = agent.get_mask_confidence_batch([buf_state], [buf_buffer_boxes])
+
+                        envs.remotes[0].send(('get_proxy_scores', (buf_mask_probs[0], buf_buffer_boxes, max_buffer_size)))
+                        buf_proxy_scores = envs.remotes[0].recv()
+
+                        buf_h_idx = agent.get_action_with_prior(buf_state, buf_proxy_scores, buffer_boxes=buf_buffer_boxes)
+                        if buf_h_idx == 5:
+                            break
+
+                        envs.remotes[0].send(('choose_action_by_heuristic', (heuristic_map[buf_h_idx], None)))
+                        buf_action, _ = envs.remotes[0].recv()
+
+                        if buf_action is not None:
+                            free_buf_now = max_buffer_size - len(buffer) + 1
+                            envs.remotes[0].send(('step', (buf_action, free_buf_now, max_buffer_size)))
+                            _, _, buf_done, _ = envs.remotes[0].recv()
+                            buffer.pop(0)
+                            if buf_done:
+                                done = True; break
+                        else:
+                            break
+
+                    if local_done:
+                        done = True
+                else:
+                    if len(buffer) < max_buffer_size:
+                        buffer.append(box_dims)
+                    else:
+                        done = True; break
+
+        # Buffer passes
+        while not done and len(buffer) > 0:
+            made_progress = False
+            new_buffer = []
+            for box in buffer:
+                envs.remotes[0].send(('can_place_box', box))
+                if not envs.remotes[0].recv():
+                    if len(new_buffer) < max_buffer_size:
+                        new_buffer.append(box)
+                    continue
+
+                envs.remotes[0].send(('new_box_arrival', box))
+                state = envs.remotes[0].recv()
+                mask_probs = agent.get_mask_confidence_batch([state], [new_buffer])[0]
+
+                envs.remotes[0].send(('get_proxy_scores', (mask_probs, new_buffer, max_buffer_size)))
+                mask_bias = envs.remotes[0].recv()
+
+                h_idx = agent.get_action_with_prior(state, mask_bias, buffer_boxes=new_buffer)
+                if h_idx == 5:
+                    if len(new_buffer) < max_buffer_size:
+                        new_buffer.append(box)
+                    continue
+
+                envs.remotes[0].send(('choose_action_by_heuristic', (heuristic_map[h_idx], None)))
+                action, _ = envs.remotes[0].recv()
+
+                if action is not None:
+                    free_buf_now = max_buffer_size - len(new_buffer)
+                    envs.remotes[0].send(('step', (action, free_buf_now, max_buffer_size)))
+                    _, _, local_done, _ = envs.remotes[0].recv()
+                    made_progress = True
+                    if local_done:
+                        done = True; break
+                else:
+                    if len(new_buffer) < max_buffer_size:
+                        new_buffer.append(box)
+
+            buffer = new_buffer
+            if not made_progress: break
+
+        # Get env info for visualization
+        envs.remotes[0].send(('get_env_info', {'full': True}))
+        info = envs.remotes[0].recv()
+
+        pallet_vol = 10 * 10 * 10
+        placed_vol = sum(b[2] * b[3] * b[4] for b in info['placed_boxes']) if info['placed_boxes'] else 0
+        utilization = placed_vol / pallet_vol
+
+        # Render visualization locally
+        fig = plt.figure(figsize=(15, 8))
+        ax = fig.add_subplot(111, projection='3d')
+        if info['placed_boxes']:
+            for j, (xx, yy, w, d, h, base_z) in enumerate(info['placed_boxes']):
+                color = plt.cm.tab20(j % 20)
+                ax.bar3d(xx, yy, base_z, w, d, h, color=color, edgecolor='black', alpha=0.8, linewidth=0.5)
+        ax.set_title(
+            f"Episode {i+1} - 3D Box Visualization\n"
+            f"Utilization: {utilization:.1%} | "
+            f"Invalid Learned: {info['invalid_learned']} | Invalid Attempted: {info['invalid_attempted']}"
+        )
+        ax.set_xlim(0, 10); ax.set_ylim(0, 10); ax.set_zlim(0, 10)
+        ax.set_xlabel('X Position'); ax.set_ylabel('Y Position'); ax.set_zlabel('Height')
+        filename = os.path.join(output_dir, f'episode_{i+1}_results.png')
+        plt.savefig(filename, dpi=150, bbox_inches='tight')
+        plt.close()
+
+    envs.close()
+    agent.epsilon = orig_eps
+
+
+def run_epoch_training_v5(output_dir, train_episodes=10000, val_episodes=None, patience=30, max_epochs=20, buffer_size=0, num_envs=8):
+    """Experiment 13: Improved Buffer-as-Action using v5 agent (context-dependent buffer rewards)."""
+    from oskp_rl_up_buffer_experiments_v5 import DQNAgent as DQNAgentV5, BoxPilingEnv as BoxPilingEnvV5
+    from parallel_train_v5 import parallel_train_one_epoch as parallel_train_one_epoch_v5
+
+    print(f"\n=== Experiment 13: Improved Buffer-as-Action Training (Buffer={buffer_size}) ===")
+    os.makedirs(output_dir, exist_ok=True)
+
+    # Load Data
+    train_data = load_instances("approachesO3DKP/ga_mixed_large.pt")
+    val_cut1 = load_instances("approachesO3DKP/cut_1.pt")
+    val_cut2 = load_instances("approachesO3DKP/cut_2.pt")
+    val_rs = load_instances("approachesO3DKP/rs.pt")
+
+    if val_episodes:
+        val_cut1 = val_cut1[:val_episodes]
+        val_cut2 = val_cut2[:val_episodes]
+        val_rs = val_rs[:val_episodes]
+
+    models_dir = os.path.join(output_dir, "models")
+    os.makedirs(models_dir, exist_ok=True)
+
+    # Init v5 Agent
+    env = BoxPilingEnvV5()
+    agent = DQNAgentV5(
+        state_dims={'height_map': env.pallet_size, 'box_dims': 3},
+        action_size=6,
+        max_height=env.max_height,
+        learning_rate=0.0001,
+        max_buffer_slots=max(buffer_size, 1),
+    )
+
+    agent.batch_size = 64
+
+    # LR Scheduler
+    scheduler = torch.optim.lr_scheduler.StepLR(agent.optimizer, step_size=5, gamma=0.5)
+
+    agent.epsilon = 1.0
+    agent.epsilon_decay = 0.999980  # Slower decay for 6-action exploration
+
+    epoch_results = []
+    best_avg_util = 0.0
+    epochs_without_improvement = 0
+    best_model_path = os.path.join(models_dir, "dqn_best_epoch.pt")
+    results_csv = os.path.join(output_dir, "epoch_training_results.csv")
+
+    env_params = {'max_buffer_size': buffer_size, 'min_support_ratio': 0.60, 'require_opposite_edge_support': True}
+
+    for epoch in range(1, max_epochs + 1):
+        print(f"\n{'='*50}")
+        current_lr = scheduler.get_last_lr()[0]
+        print(f"EPOCH {epoch}/{max_epochs} | LR: {current_lr:.6f} | Start Eps: {agent.epsilon:.4f}")
+        print(f"{'='*50}")
+
+        import random
+        train_subset = random.sample(train_data, min(len(train_data), train_episodes))
+        random.shuffle(train_subset)
+
+        train_out_dir = os.path.join(output_dir, f"epoch_{epoch}")
+        os.makedirs(train_out_dir, exist_ok=True)
+
+        # Use parallel training (v5)
+        metrics = parallel_train_one_epoch_v5(agent, train_subset, train_out_dir, env_params, n_envs=num_envs)
+        scheduler.step()
+
+        print(f"  New Learning Rate: {scheduler.get_last_lr()[0]:.6f}")
+        print(f"  Buffer Defers: {metrics['buffer_defer_count']} | Buffer Place-After: {metrics['buffer_place_after_count']}")
+
+        # Validate using v5 evaluate
+        print(f"\nValidating Epoch {epoch}...")
+        v_cut1 = evaluate_v5(agent, val_cut1, env_params, n_envs=num_envs)
+        v_cut2 = evaluate_v5(agent, val_cut2, env_params, n_envs=num_envs)
+        v_rs = evaluate_v5(agent, val_rs, env_params, n_envs=num_envs)
+
+        s_cut1 = v_cut1['avg_util']
+        s_cut2 = v_cut2['avg_util']
+        s_rs = v_rs['avg_util']
+        avg_util = (s_cut1 + s_cut2 + s_rs) / 3
+
+        print(f"  Epoch {epoch} Results:")
+        print(f"    CUT-1: {s_cut1:.2%}, CUT-2: {s_cut2:.2%}, RS: {s_rs:.2%}")
+        print(f"    Avg Util: {avg_util:.2%} | End Eps: {agent.epsilon:.4f}")
+        print(f"    Val Buffer Defers: cut1={v_cut1['buffer_defer_count']}, cut2={v_cut2['buffer_defer_count']}, rs={v_rs['buffer_defer_count']}")
+
+        result_row = {
+            'epoch': epoch,
+            'train_util': metrics['avg_util'],
+            'train_q_loss': metrics['avg_q_loss'],
+            'train_mask_loss': metrics['avg_mask_loss'],
+            'val_cut1_util': s_cut1,
+            'val_cut2_util': s_cut2,
+            'val_rs_util': s_rs,
+            'avg_val_util': avg_util,
+            'invalid_learned': metrics['invalid_learned'],
+            'invalid_attempted': metrics['invalid_attempted'],
+            'epsilon': agent.epsilon,
+            'lr': current_lr,
+            'buffer_defer_count': metrics['buffer_defer_count'],
+            'buffer_place_after_count': metrics['buffer_place_after_count'],
+        }
+        for k, v in metrics['heuristics'].items(): result_row[f'train_h_{k}'] = v
+        for k, v in v_cut1['heuristics'].items(): result_row[f'val_cut1_h_{k}'] = v
+        for k, v in v_cut2['heuristics'].items(): result_row[f'val_cut2_h_{k}'] = v
+        for k, v in v_rs['heuristics'].items(): result_row[f'val_rs_h_{k}'] = v
+
+        epoch_results.append(result_row)
+        pd.DataFrame(epoch_results).to_csv(results_csv, index=False)
+
+        # Save Visualizations
+        print(f"Saving visualizations for Epoch {epoch}...")
+        vis_epoch_dir = os.path.join(output_dir, "visualizations", f"epoch_{epoch}")
+        save_visualizations_v5(agent, val_cut1, os.path.join(vis_epoch_dir, "cut1"), env_params, n_samples=10)
+        save_visualizations_v5(agent, val_cut2, os.path.join(vis_epoch_dir, "cut2"), env_params, n_samples=10)
+        save_visualizations_v5(agent, val_rs, os.path.join(vis_epoch_dir, "rs"), env_params, n_samples=10)
+
+        # Plot Progress
+        plot_experiment_results(epoch_results, output_dir)
+
+        if avg_util >= best_avg_util:
+            best_avg_util = avg_util
+            agent.save_model(best_model_path)
+            epochs_without_improvement = 0
+            print(f"  * New best model saved!")
+        else:
+            epochs_without_improvement += 1
+            print(f"  No significant improvement ({epochs_without_improvement}/{patience})")
+
+        if epochs_without_improvement >= patience:
+            print("Early Stopping Reached.")
+            break
+
+    return epoch_results
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--exp", type=int, choices=[5, 6, 7, 8, 9, 10], default=10, help="Experiment number")
+    parser.add_argument("--exp", type=int, choices=[5, 6, 7, 8, 9, 10, 11, 12, 13], default=10, help="Experiment number")
     parser.add_argument("--episodes", type=int, default=10000, help="Number of training episodes per epoch")
     parser.add_argument("--val-episodes", type=int, default=None, help="Number of validation episodes")
     parser.add_argument("--max-epochs", type=int, default=20, help="Maximum number of epochs")
     parser.add_argument("--patience", type=int, default=30, help="Early stopping patience")
-    parser.add_argument("--buffer-size", type=int, default=0, help="Buffer size for Experiment 10")
+    parser.add_argument("--buffer-size", type=int, default=0, help="Buffer size for Experiment 10/11")
     parser.add_argument("--num-envs", type=int, default=8, help="Number of parallel environments for training")
     args = parser.parse_args()
-    
+
     base_output = "experiments_results_refactored"
-    
+
     if args.exp == 5:
         run_buffer_comparison_v2(os.path.join(base_output, "exp5_buffer_comparison"), args.episodes, args.val_episodes)
     elif args.exp == 6:
@@ -1136,8 +2484,20 @@ if __name__ == "__main__":
     elif args.exp == 9:
         grid_search(os.path.join(base_output, "exp9_grid_search"), args.episodes, args.val_episodes)
     elif args.exp == 10:
-        run_epoch_training(os.path.join(base_output, "exp10_epoch_training_parallel_v2"), 
-                           args.episodes, args.val_episodes, args.patience, 
+        run_epoch_training(os.path.join(base_output, "exp10_epoch_training_parallel_v2_buffer_size_4"),
+                           args.episodes, args.val_episodes, args.patience,
                            args.max_epochs, args.buffer_size, args.num_envs)
+    elif args.exp == 11:
+        run_epoch_training_v3(os.path.join(base_output, f"exp11_epoch_training_buffer_dims_size_{args.buffer_size}"),
+                              args.episodes, args.val_episodes, args.patience,
+                              args.max_epochs, args.buffer_size, args.num_envs)
+    elif args.exp == 12:
+        run_epoch_training_v4(os.path.join(base_output, f"exp12_buffer_as_action_size_{args.buffer_size}"),
+                              args.episodes, args.val_episodes, args.patience,
+                              args.max_epochs, args.buffer_size, args.num_envs)
+    elif args.exp == 13:
+        run_epoch_training_v5(os.path.join(base_output, f"exp13_improved_buffer_action_size_{args.buffer_size}"),
+                              args.episodes, args.val_episodes, args.patience,
+                              args.max_epochs, args.buffer_size, args.num_envs)
     else:
-        print("Use --exp 5, 6, 7, 8, 9, or 10.")
+        print("Use --exp 5, 6, 7, 8, 9, 10, 11, 12, or 13.")

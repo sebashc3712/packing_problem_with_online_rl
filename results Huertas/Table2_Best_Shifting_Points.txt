@@ -1,0 +1,6 @@
+Table 2. Best shifting points of the probabilities to select the stacking and the semi-perfect fit heuristics.
+
+Dataset	Threshold (%)	Utilization (%)
+Cut-1	10	57.67
+Cut-2	0	57.78
+RS	10	45.10
