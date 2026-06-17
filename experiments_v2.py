@@ -2460,9 +2460,279 @@ def run_epoch_training_v5(output_dir, train_episodes=10000, val_episodes=None, p
     return epoch_results
 
 
+# =====================================================
+# Experiment 14: Corner-Only Heuristic (v6 agent, no buffer)
+# =====================================================
+
+def evaluate_corner_only(agent, episodes_boxes, env_params):
+    """Evaluate v6 agent (corner-only, 1 action, no buffer)."""
+    from oskp_rl_up_buffer_experiments_v6 import BoxPilingEnv as BoxPilingEnvV6
+    from oskp_rl_up_buffer_experiments_v6 import proxy_scores_for_heuristics as proxy_scores_v6
+
+    env_args = env_params.copy()
+    max_buffer_size = env_args.pop('max_buffer_size', 0)
+    env_args.pop('min_support_ratio', None)
+    env_args.pop('require_opposite_edge_support', None)
+
+    env = BoxPilingEnvV6(**env_args)
+
+    total_utilization = 0.0
+    heuristic_map = {0: 'corner'}
+    heuristic_counts = {k: 0 for k in heuristic_map.values()}
+    total_decisions = 0
+    total_invalid_learned = 0
+    total_invalid_attempted = 0
+
+    original_eps = agent.epsilon
+    agent.epsilon = 0.0
+
+    for boxes in episodes_boxes:
+        state = env.reset()
+        done = False
+        box_idx = 0
+
+        while not done and box_idx < len(boxes):
+            box_dims = boxes[box_idx]
+            box_idx += 1
+
+            state = env.new_box_arrival(box_dims)
+            pred_mask = agent.predict_mask(state, buffer_count=0)
+
+            mask_bias = proxy_scores_v6(
+                env.current_height_map, env.current_box,
+                env.pallet_size, env.max_height, pred_mask
+            )
+
+            h_idx = agent.get_action_with_prior(state, mask_bias, buffer_count=0)
+            heuristic = heuristic_map[h_idx]
+            heuristic_counts[heuristic] += 1
+            total_decisions += 1
+
+            action, _ = env.choose_action_by_heuristic(heuristic, pred_mask=pred_mask)
+            if action is None:
+                action, _ = env.choose_action_by_heuristic(heuristic, pred_mask=None)
+
+            if action is not None:
+                next_state, reward, local_done, _ = env.step(action)
+                state = next_state
+            else:
+                done = True
+                break
+
+            if env._is_terminal():
+                done = True
+                break
+
+        total_invalid_learned += env.invalid_actions_learned
+        total_invalid_attempted += env.invalid_actions_attempted
+
+        pallet_volume = env.pallet_size[0] * env.pallet_size[1] * env.max_height
+        placed_volume = sum(b[2] * b[3] * b[4] for b in env.placed_boxes)
+        utilization = placed_volume / pallet_volume if pallet_volume > 0 else 0
+        total_utilization += utilization
+
+    agent.epsilon = original_eps
+
+    avg_util = total_utilization / len(episodes_boxes)
+    h_percs = {k: v / total_decisions if total_decisions > 0 else 0 for k, v in heuristic_counts.items()}
+
+    return {
+        'avg_util': avg_util,
+        'heuristics': h_percs,
+        'invalid_learned': total_invalid_learned,
+        'invalid_attempted': total_invalid_attempted
+    }
+
+
+def save_visualizations_corner_only(agent, episodes_boxes, output_dir, env_params, n_samples=10):
+    """Run v6 corner-only agent on N samples and save 3D visualizations."""
+    import random
+    from oskp_rl_up_buffer_experiments_v6 import BoxPilingEnv as BoxPilingEnvV6
+    from oskp_rl_up_buffer_experiments_v6 import proxy_scores_for_heuristics as proxy_scores_v6
+
+    os.makedirs(output_dir, exist_ok=True)
+    samples = random.sample(episodes_boxes, min(n_samples, len(episodes_boxes)))
+
+    orig_eps = agent.epsilon
+    agent.epsilon = 0.0
+
+    env = BoxPilingEnvV6()
+    heuristic_map = {0: 'corner'}
+
+    for i, boxes in enumerate(samples):
+        state = env.reset()
+        done = False
+        box_idx = 0
+
+        while not done and box_idx < len(boxes):
+            box_dims = boxes[box_idx]
+            box_idx += 1
+            state = env.new_box_arrival(box_dims)
+            pred_mask = agent.predict_mask(state, buffer_count=0)
+            mask_bias = proxy_scores_v6(
+                env.current_height_map, env.current_box,
+                env.pallet_size, env.max_height, pred_mask
+            )
+            h_idx = agent.get_action_with_prior(state, mask_bias, buffer_count=0)
+            heuristic = heuristic_map[h_idx]
+            action, _ = env.choose_action_by_heuristic(heuristic, pred_mask=pred_mask)
+            if action is None:
+                action, _ = env.choose_action_by_heuristic(heuristic, pred_mask=None)
+
+            if action is not None:
+                next_state, _, _, _ = env.step(action)
+                state = next_state
+            else:
+                done = True; break
+            if env._is_terminal():
+                done = True; break
+
+        env.visualize_pallet(
+            episode_num=i+1,
+            boxes_attempted=box_idx,
+            utilization=env.current_height_map.sum() / (env.pallet_size[0] * env.pallet_size[1] * env.max_height),
+            invalid_learned=env.invalid_actions_learned,
+            invalid_attempted=env.invalid_actions_attempted,
+            output_dir=output_dir
+        )
+
+    agent.epsilon = orig_eps
+
+
+def run_epoch_training_corner_only(output_dir, train_episodes=10000, val_episodes=None, patience=30, max_epochs=20, num_envs=8):
+    """Experiment 14: Corner-Only heuristic using v6 agent (1 action, no buffer)."""
+    from oskp_rl_up_buffer_experiments_v6 import DQNAgent as DQNAgentV6, BoxPilingEnv as BoxPilingEnvV6
+    from parallel_train_v6 import parallel_train_one_epoch as parallel_train_one_epoch_v6
+
+    print(f"\n=== Experiment 14: Corner-Only Training (No Buffer) ===")
+    os.makedirs(output_dir, exist_ok=True)
+
+    # Load Data
+    train_data = load_instances("approachesO3DKP/ga_mixed_large.pt")
+    val_cut1 = load_instances("approachesO3DKP/cut_1.pt")
+    val_cut2 = load_instances("approachesO3DKP/cut_2.pt")
+    val_rs = load_instances("approachesO3DKP/rs.pt")
+
+    if val_episodes:
+        val_cut1 = val_cut1[:val_episodes]
+        val_cut2 = val_cut2[:val_episodes]
+        val_rs = val_rs[:val_episodes]
+
+    models_dir = os.path.join(output_dir, "models")
+    os.makedirs(models_dir, exist_ok=True)
+
+    # Init v6 Agent
+    env = BoxPilingEnvV6()
+    agent = DQNAgentV6(
+        state_dims={'height_map': env.pallet_size, 'box_dims': 3},
+        action_size=1,
+        max_height=env.max_height,
+        learning_rate=0.0001,
+        min_support_ratio=0.60,
+        require_opposite_edge_support=True,
+    )
+
+    agent.batch_size = 64
+
+    # LR Scheduler
+    scheduler = torch.optim.lr_scheduler.StepLR(agent.optimizer, step_size=5, gamma=0.5)
+
+    agent.epsilon = 1.0
+    agent.epsilon_decay = 0.999985
+
+    epoch_results = []
+    best_avg_util = 0.0
+    epochs_without_improvement = 0
+    best_model_path = os.path.join(models_dir, "dqn_best_epoch.pt")
+    results_csv = os.path.join(output_dir, "epoch_training_results.csv")
+
+    env_params = {'max_buffer_size': 0, 'min_support_ratio': 0.60, 'require_opposite_edge_support': True}
+
+    for epoch in range(1, max_epochs + 1):
+        print(f"\n{'='*50}")
+        current_lr = scheduler.get_last_lr()[0]
+        print(f"EPOCH {epoch}/{max_epochs} | LR: {current_lr:.6f} | Start Eps: {agent.epsilon:.4f}")
+        print(f"{'='*50}")
+
+        import random
+        train_subset = random.sample(train_data, min(len(train_data), train_episodes))
+        random.shuffle(train_subset)
+
+        train_out_dir = os.path.join(output_dir, f"epoch_{epoch}")
+        os.makedirs(train_out_dir, exist_ok=True)
+
+        # Use parallel training (v6)
+        metrics = parallel_train_one_epoch_v6(agent, train_subset, train_out_dir, env_params, n_envs=num_envs)
+        scheduler.step()
+
+        print(f"  New Learning Rate: {scheduler.get_last_lr()[0]:.6f}")
+
+        # Validate using corner-only evaluate
+        print(f"\nValidating Epoch {epoch}...")
+        v_cut1 = evaluate_corner_only(agent, val_cut1, env_params)
+        v_cut2 = evaluate_corner_only(agent, val_cut2, env_params)
+        v_rs = evaluate_corner_only(agent, val_rs, env_params)
+
+        s_cut1 = v_cut1['avg_util']
+        s_cut2 = v_cut2['avg_util']
+        s_rs = v_rs['avg_util']
+        avg_util = (s_cut1 + s_cut2 + s_rs) / 3
+
+        print(f"  Epoch {epoch} Results:")
+        print(f"    CUT-1: {s_cut1:.2%}, CUT-2: {s_cut2:.2%}, RS: {s_rs:.2%}")
+        print(f"    Avg Util: {avg_util:.2%} | End Eps: {agent.epsilon:.4f}")
+
+        result_row = {
+            'epoch': epoch,
+            'train_util': metrics['avg_util'],
+            'train_q_loss': metrics['avg_q_loss'],
+            'train_mask_loss': metrics['avg_mask_loss'],
+            'val_cut1_util': s_cut1,
+            'val_cut2_util': s_cut2,
+            'val_rs_util': s_rs,
+            'avg_val_util': avg_util,
+            'invalid_learned': metrics['invalid_learned'],
+            'invalid_attempted': metrics['invalid_attempted'],
+            'epsilon': agent.epsilon,
+            'lr': current_lr
+        }
+        for k, v in metrics['heuristics'].items(): result_row[f'train_h_{k}'] = v
+        for k, v in v_cut1['heuristics'].items(): result_row[f'val_cut1_h_{k}'] = v
+        for k, v in v_cut2['heuristics'].items(): result_row[f'val_cut2_h_{k}'] = v
+        for k, v in v_rs['heuristics'].items(): result_row[f'val_rs_h_{k}'] = v
+
+        epoch_results.append(result_row)
+        pd.DataFrame(epoch_results).to_csv(results_csv, index=False)
+
+        # Save Visualizations
+        print(f"Saving visualizations for Epoch {epoch}...")
+        vis_epoch_dir = os.path.join(output_dir, "visualizations", f"epoch_{epoch}")
+        save_visualizations_corner_only(agent, val_cut1, os.path.join(vis_epoch_dir, "cut1"), env_params, n_samples=10)
+        save_visualizations_corner_only(agent, val_cut2, os.path.join(vis_epoch_dir, "cut2"), env_params, n_samples=10)
+        save_visualizations_corner_only(agent, val_rs, os.path.join(vis_epoch_dir, "rs"), env_params, n_samples=10)
+
+        # Plot Progress
+        plot_experiment_results(epoch_results, output_dir)
+
+        if avg_util >= best_avg_util:
+            best_avg_util = avg_util
+            agent.save_model(best_model_path)
+            epochs_without_improvement = 0
+            print(f"  * New best model saved!")
+        else:
+            epochs_without_improvement += 1
+            print(f"  No significant improvement ({epochs_without_improvement}/{patience})")
+
+        if epochs_without_improvement >= patience:
+            print("Early Stopping Reached.")
+            break
+
+    return epoch_results
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--exp", type=int, choices=[5, 6, 7, 8, 9, 10, 11, 12, 13], default=10, help="Experiment number")
+    parser.add_argument("--exp", type=int, choices=[5, 6, 7, 8, 9, 10, 11, 12, 13, 14], default=10, help="Experiment number")
     parser.add_argument("--episodes", type=int, default=10000, help="Number of training episodes per epoch")
     parser.add_argument("--val-episodes", type=int, default=None, help="Number of validation episodes")
     parser.add_argument("--max-epochs", type=int, default=20, help="Maximum number of epochs")
@@ -2499,5 +2769,9 @@ if __name__ == "__main__":
         run_epoch_training_v5(os.path.join(base_output, f"exp13_improved_buffer_action_size_{args.buffer_size}"),
                               args.episodes, args.val_episodes, args.patience,
                               args.max_epochs, args.buffer_size, args.num_envs)
+    elif args.exp == 14:
+        run_epoch_training_corner_only(os.path.join(base_output, "exp14_corner_only"),
+                                       args.episodes, args.val_episodes, args.patience,
+                                       args.max_epochs, args.num_envs)
     else:
-        print("Use --exp 5, 6, 7, 8, 9, 10, 11, 12, or 13.")
+        print("Use --exp 5, 6, 7, 8, 9, 10, 11, 12, 13, or 14.")

@@ -1,2 +1,6 @@
 *.pt
 experiments_results_refactored/
+__pycache__/
+*.pyc
+.DS_Store
+*$py.class
